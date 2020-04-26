@@ -94,6 +94,8 @@ BinOp::BinOp(Type &type, string &&name, Value &lhs, Value &rhs, Op op,
   case FMul:
   case FDiv:
   case FRem:
+  case FMin:
+  case FMax:
     assert(flags == None);
     break;
   case SRem:
@@ -161,6 +163,8 @@ void BinOp::print(ostream &os) const {
   case FMul:          str = "fmul "; break;
   case FDiv:          str = "fdiv "; break;
   case FRem:          str = "frem "; break;
+  case FMax:          str = "fmax "; break;
+  case FMin:          str = "fmin "; break;
   }
 
   os << getName() << " = " << str;
@@ -482,6 +486,26 @@ StateValue BinOp::toSMT(State &s) const {
                        false);
     };
     break;
+
+  case FMin:
+  case FMax:
+    fn = [&](auto a, auto ap, auto b, auto bp) -> StateValue {
+      expr ndet = expr::mkFreshVar("maxminnondet", true);
+      s.addQuantVar(ndet);
+      auto ndz = expr::mkIf(ndet, expr::mkNumber("0", a),
+                            expr::mkNumber("-0", a));
+
+      auto v = [&](expr &a, expr &b) {
+        expr z = a.isFPZero() && b.isFPZero();
+        expr cmp = (op == FMin) ? a.fole(b) : a.foge(b);
+        return expr::mkIf(a.isNaN(), b,
+                          expr::mkIf(b.isNaN(), a,
+                                     expr::mkIf(z, ndz,
+                                                expr::mkIf(cmp, a, b))));
+      };
+      return fm_poison(s, a, b, v, fmath, false);
+    };
+    break;
   }
 
   function<pair<StateValue,StateValue>(const expr&, const expr&, const expr&,
@@ -504,12 +528,15 @@ StateValue BinOp::toSMT(State &s) const {
   auto &b = s[*rhs];
 
   if (lhs->getType().isVectorType()) {
-    auto ty = getType().getAsAggregateType();
+    auto retty = getType().getAsAggregateType();
     vector<StateValue> vals;
 
     if (vertical_zip) {
       auto ty = lhs->getType().getAsAggregateType();
       vector<StateValue> vals1, vals2;
+      unsigned val2idx = 1 + retty->isPadding(1);
+      auto val1ty = retty->getChild(0).getAsAggregateType();
+      auto val2ty = retty->getChild(val2idx).getAsAggregateType();
 
       for (unsigned i = 0, e = ty->numElementsConst(); i != e; ++i) {
         auto ai = ty->extract(a, i);
@@ -519,12 +546,12 @@ StateValue BinOp::toSMT(State &s) const {
         vals1.emplace_back(move(v1));
         vals2.emplace_back(move(v2));
       }
-      vals.emplace_back(ty->aggregateVals(vals1));
-      vals.emplace_back(ty->aggregateVals(vals2));
+      vals.emplace_back(val1ty->aggregateVals(vals1));
+      vals.emplace_back(val2ty->aggregateVals(vals2));
     } else {
       StateValue tmp;
-      for (unsigned i = 0, e = ty->numElementsConst(); i != e; ++i) {
-        auto ai = ty->extract(a, i);
+      for (unsigned i = 0, e = retty->numElementsConst(); i != e; ++i) {
+        auto ai = retty->extract(a, i);
         const StateValue *bi;
         switch (op) {
         case Cttz:
@@ -532,7 +559,7 @@ StateValue BinOp::toSMT(State &s) const {
           bi = &b;
           break;
         default:
-          tmp = ty->extract(b, i);
+          tmp = retty->extract(b, i);
           bi = &tmp;
           break;
         }
@@ -540,7 +567,7 @@ StateValue BinOp::toSMT(State &s) const {
                                     bi->non_poison));
       }
     }
-    return ty->aggregateVals(vals);
+    return retty->aggregateVals(vals, true);
   }
 
   if (vertical_zip) {
@@ -548,7 +575,7 @@ StateValue BinOp::toSMT(State &s) const {
     auto [v1, v2] = zip_op(a.value, a.non_poison, b.value, b.non_poison);
     vals.emplace_back(move(v1));
     vals.emplace_back(move(v2));
-    return getType().getAsAggregateType()->aggregateVals(vals);
+    return getType().getAsAggregateType()->aggregateVals(vals, true);
   }
   return scalar_op(a.value, a.non_poison, b.value, b.non_poison);
 }
@@ -567,10 +594,11 @@ expr BinOp::getTypeConstraints(const Function &f) const {
                   lhs->getType() == rhs->getType();
 
     if (auto ty = getType().getAsStructType()) {
-      instrconstr &= ty->numElements() == 2 &&
+      unsigned v2idx = 1 + ty->isPadding(1);
+      instrconstr &= ty->numElementsExcludingPadding() == 2 &&
                      ty->getChild(0) == lhs->getType() &&
-                     ty->getChild(1).enforceIntOrVectorType(1) &&
-                     ty->getChild(1).enforceVectorTypeEquiv(lhs->getType());
+                     ty->getChild(v2idx).enforceIntOrVectorType(1) &&
+                     ty->getChild(v2idx).enforceVectorTypeEquiv(lhs->getType());
     }
     break;
   case Cttz:
@@ -584,6 +612,8 @@ expr BinOp::getTypeConstraints(const Function &f) const {
   case FMul:
   case FDiv:
   case FRem:
+  case FMax:
+  case FMin:
     instrconstr = getType().enforceFloatOrVectorType() &&
                   getType() == lhs->getType() &&
                   getType() == rhs->getType();
@@ -1054,7 +1084,6 @@ expr Select::getTypeConstraints(const Function &f) const {
   return Value::getTypeConstraints() &&
          cond->getType().enforceIntOrVectorType(1) &&
          getType().enforceVectorTypeIff(cond->getType()) &&
-         getType().enforceIntOrFloatOrPtrOrVectorType() &&
          getType() == a->getType() &&
          getType() == b->getType();
 }
@@ -1257,20 +1286,16 @@ void FnCall::print(ostream &os) const {
 
 static void unpack_inputs(State&s, Type &ty, unsigned argflag,
                           const StateValue &value, vector<StateValue> &inputs,
-                          vector<pair<StateValue, bool>> &ptr_inputs,
-                          vector<StateValue> &returned_val) {
+                          vector<pair<StateValue, bool>> &ptr_inputs) {
   if (auto agg = ty.getAsAggregateType()) {
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
       unpack_inputs(s, agg->getChild(i), argflag, agg->extract(value, i),
-                    inputs, ptr_inputs, returned_val);
+                    inputs, ptr_inputs);
     }
   } else {
-    if (argflag & FnCall::ArgReturned)
-      returned_val.emplace_back(value);
-
     if (ty.isPtrType()) {
       Pointer p(s.getMemory(), value.value);
-      p.strip_attrs();
+      p.stripAttrs();
       ptr_inputs.emplace_back(StateValue(p.release(), expr(value.non_poison)),
                               argflag & FnCall::ArgByVal);
     } else {
@@ -1299,7 +1324,7 @@ static StateValue pack_return(Type &ty, vector<StateValue> &vals,
     return agg->aggregateVals(vs);
   }
 
-  auto ret = vals[idx++];
+  auto &ret = vals[idx++];
   if (ty.isFloatType() && (flags & FnCall::NNaN))
     ret.non_poison &= !ret.value.isNaN();
   return ret;
@@ -1314,14 +1339,12 @@ StateValue FnCall::toSMT(State &s) const {
   vector<StateValue> inputs;
   vector<pair<StateValue, bool>> ptr_inputs;
   vector<Type*> out_types;
-  vector<StateValue> returned_val;
 
   ostringstream fnName_mangled;
   fnName_mangled << fnName;
   for (auto &[arg, flags] : args) {
-    unpack_inputs(s, arg->getType(), flags, s[*arg], inputs, ptr_inputs,
-                  returned_val);
-    fnName_mangled << "#" << arg->getType().toString();
+    unpack_inputs(s, arg->getType(), flags, s[*arg], inputs, ptr_inputs);
+    fnName_mangled << '#' << arg->getType().toString();
   }
   fnName_mangled << '!' << getType();
   if (!isVoid())
@@ -1330,7 +1353,7 @@ StateValue FnCall::toSMT(State &s) const {
   unsigned idx = 0;
   auto ret = s.addFnCall(fnName_mangled.str(), move(inputs), move(ptr_inputs),
                          out_types, !(flags & NoRead), !(flags & NoWrite),
-                         flags & ArgMemOnly, move(returned_val));
+                         flags & ArgMemOnly);
   return isVoid() ? StateValue() : pack_return(getType(), ret, flags, idx);
 }
 
@@ -1504,8 +1527,8 @@ void FCmp::print(ostream &os) const {
   case UNE:   condtxt = "une "; break;
   case UNO:   condtxt = "uno "; break;
   }
-  os << getName() << " = fcmp " << fmath << condtxt << print_type(getType())
-     << a->getName() << ", " << b->getName();
+  os << getName() << " = fcmp " << fmath << condtxt << *a << ", "
+     << b->getName();
 }
 
 StateValue FCmp::toSMT(State &s) const {
@@ -1845,7 +1868,7 @@ static void addUBForNoCaptureRet(State &s, const StateValue &svret,
                                  const Type &t) {
   auto &[vret, npret] = svret;
   if (t.isPtrType()) {
-    s.addUB(npret.implies(!Pointer(s.getMemory(), vret).is_nocapture()));
+    s.addUB(npret.implies(!Pointer(s.getMemory(), vret).isNocapture()));
     return;
   }
 
@@ -1859,7 +1882,7 @@ static void addUBForNoCaptureRet(State &s, const StateValue &svret,
 StateValue Return::toSMT(State &s) const {
   // Encode nocapture semantics.
   auto &retval = s[*val];
-  s.addUB(s.getMemory().check_nocapture());
+  s.addUB(s.getMemory().checkNocapture());
   addUBForNoCaptureRet(s, retval, val->getType());
   s.addReturn(retval);
   return {};
@@ -1996,7 +2019,7 @@ StateValue Malloc::toSMT(State &s) const {
     s.addUB(np_ptr);
 
     Pointer ptr(s.getMemory(), p);
-    expr p_sz = ptr.block_size();
+    expr p_sz = ptr.blockSize();
     expr sz_zext = sz.zextOrTrunc(p_sz.bits());
 
     expr memcpy_size = expr::mkIf(allocated,
@@ -2086,7 +2109,7 @@ void StartLifetime::print(std::ostream &os) const {
 StateValue StartLifetime::toSMT(State &s) const {
   auto &[p, np] = s[*ptr];
   s.addUB(np);
-  s.getMemory().start_lifetime(p);
+  s.getMemory().startLifetime(p);
   return {};
 }
 
@@ -2179,7 +2202,7 @@ StateValue GEP::toSMT(State &s) const {
         if (sz != 0)
           non_poison.add(val.sextOrTrunc(v.bits()) == v);
         non_poison.add(multiplier.mul_no_soverflow(val));
-        non_poison.add(ptr.add_no_overflow(inc));
+        non_poison.add(ptr.addNoOverflow(inc));
       }
 
 #ifndef NDEBUG
