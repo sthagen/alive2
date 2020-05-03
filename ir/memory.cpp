@@ -476,7 +476,8 @@ expr Pointer::getAddress(bool simplify) const {
   auto zero = expr::mkUInt(0, bits_size_t - 1);
   // fast path for null ptrs
   auto non_local
-    = simplify && bid.isZero() ? zero : expr::mkUF("blk_addr", { bid }, zero);
+    = simplify && bid.isZero() && has_null_block ?
+          zero : expr::mkUF("blk_addr", { bid }, zero);
   // Non-local block area is the lower half
   non_local = expr::mkUInt(0, 1).concat(non_local);
 
@@ -900,13 +901,13 @@ void Pointer::stripAttrs() {
 
 Pointer Pointer::mkNullPointer(const Memory &m) {
   // Null pointer exists if either source or target uses it.
-  assert(num_nonlocals > 0);
+  assert(has_null_block);
   // A null pointer points to block 0 without any attribute.
   return { m, 0, false };
 }
 
 expr Pointer::isNull() const {
-  if (num_nonlocals == 0)
+  if (!has_null_block)
     return false;
   return *this == mkNullPointer(m);
 }
@@ -957,7 +958,7 @@ static vector<expr> extract_possible_local_bids(Memory &m, const Byte &b) {
 }
 
 unsigned Memory::numNonlocals() const {
-  return state->isSource() ? num_nonlocals_src : IR::num_nonlocals;
+  return state->isSource() ? num_nonlocals_src : num_nonlocals;
 }
 
 void Memory::store(const Pointer &p, const expr &val, expr &local,
@@ -1003,9 +1004,10 @@ static expr load(const Pointer &p, const expr &local, const expr &non_local) {
   return mkIf_fold(p.isLocal(), local.load(idx), non_local.load(idx));
 }
 
-// Global block id 0 is reserved for a null block.
 static unsigned last_local_bid = 0;
-static unsigned last_nonlocal_bid = 1;
+// Global block id 0 is reserved for a null block if has_null_block is true.
+// State::resetGlobals() sets last_nonlocal_bid to has_null_block.
+static unsigned last_nonlocal_bid = 0;
 
 static bool memory_unused() {
   return num_locals == 0 && num_nonlocals == 0;
@@ -1093,7 +1095,7 @@ Memory::Memory(State &state) : state(&state) {
   // the block) should not overflow.
 
   // Initialize a memory block for null pointer.
-  if (IR::num_nonlocals > 0)
+  if (has_null_block)
     alloc(expr::mkUInt(0, bits_size_t), bits_program_pointer, GLOBAL, false,
           false, 0);
 
@@ -1113,7 +1115,7 @@ void Memory::mkAxioms(const Memory &other) const {
 
   // transformation can increase alignment
   unsigned align = heap_block_alignment;
-  for (unsigned bid = 1; bid < IR::num_nonlocals; ++bid) {
+  for (unsigned bid = has_null_block; bid < num_nonlocals; ++bid) {
     Pointer p(*this, bid, false);
     Pointer q(other, bid, false);
     auto p_align = p.blockAlignment();
@@ -1126,12 +1128,12 @@ void Memory::mkAxioms(const Memory &other) const {
   if (!observes_addresses())
     return;
 
-  if (IR::num_nonlocals > 0)
+  if (has_null_block)
     state->addAxiom(Pointer::mkNullPointer(*this).getAddress(false) == 0);
 
   // Non-local blocks are disjoint.
   // Ignore null pointer block
-  for (unsigned bid = 1; bid < IR::num_nonlocals; ++bid) {
+  for (unsigned bid = has_null_block; bid < num_nonlocals; ++bid) {
     Pointer p1(*this, bid, false);
     expr disj = p1.getAddress() != 0;
 
@@ -1140,7 +1142,7 @@ void Memory::mkAxioms(const Memory &other) const {
     disj &= (p1.getAddress() + p1.blockSize()).extract(bit, bit) == 0;
 
     // disjointness constraint
-    for (unsigned bid2 = bid + 1; bid2 < IR::num_nonlocals; ++bid2) {
+    for (unsigned bid2 = bid + 1; bid2 < num_nonlocals; ++bid2) {
       Pointer p2(*this, bid2, false);
       disj &= p2.isBlockAlive()
                 .implies(disjoint(p1.getAddress(), p1.blockSize(),
@@ -1280,10 +1282,10 @@ Memory::mkCallState(const vector<pair<StateValue, bool>> *ptr_inputs) const {
   }
 
   if (num_nonlocals_src) {
-    expr one  = expr::mkUInt(1, IR::num_nonlocals);
-    expr zero = expr::mkUInt(0, IR::num_nonlocals);
+    expr one  = expr::mkUInt(1, num_nonlocals);
+    expr zero = expr::mkUInt(0, num_nonlocals);
     expr mask = one;
-    for (unsigned bid = 1; bid < IR::num_nonlocals; ++bid) {
+    for (unsigned bid = has_null_block; bid < num_nonlocals; ++bid) {
       expr ok_arg = true;
       if (ptr_inputs) {
         for (auto &[arg, is_byval_arg] : *ptr_inputs) {
@@ -1296,7 +1298,7 @@ Memory::mkCallState(const vector<pair<StateValue, bool>> *ptr_inputs) const {
       expr heap = Pointer(*this, bid, false).isHeapAllocated();
       mask = mask | expr::mkIf(heap && ok_arg,
                                zero,
-                               one << expr::mkUInt(bid, IR::num_nonlocals));
+                               one << expr::mkUInt(bid, num_nonlocals));
     }
 
     if (mask.isAllOnes()) {
@@ -1635,7 +1637,7 @@ expr Memory::int2ptr(const expr &val) const {
 pair<expr,Pointer>
 Memory::refined(const Memory &other, bool skip_constants,
                 const vector<pair<StateValue, bool>> *set_ptrs) const {
-  if (IR::num_nonlocals <= 1)
+  if (num_nonlocals <= has_null_block)
     return { true, Pointer(*this, expr()) };
 
   assert(!memory_unused());
@@ -1651,7 +1653,7 @@ Memory::refined(const Memory &other, bool skip_constants,
         m.non_local_blk_nonwritable.end();
   };
 
-  for (unsigned bid = 1; bid < IR::num_nonlocals_src; ++bid) {
+  for (unsigned bid = has_null_block; bid < num_nonlocals_src; ++bid) {
     if (skip_constants && is_constglb(*this, bid)) {
       assert(is_constglb(other, bid));
       continue;
@@ -1686,7 +1688,7 @@ expr Memory::checkNocapture() const {
   auto ofs = expr::mkVar(name.c_str(), bits_for_offset);
   expr res(true);
 
-  for (unsigned bid = 1; bid < numNonlocals(); ++bid) {
+  for (unsigned bid = has_null_block; bid < numNonlocals(); ++bid) {
     Pointer p(*this, expr::mkUInt(bid, bits_for_bid), ofs);
     Byte b(*this, non_local_block_val.load(p.shortPtr()));
     Pointer loadp(*this, b.ptrValue());
@@ -1789,9 +1791,9 @@ void Memory::print(ostream &os, const Model &m) const {
     did_header = true;
   };
 
-  if (state->isSource() && IR::num_nonlocals) {
+  if (state->isSource() && num_nonlocals) {
     header("NON-LOCAL BLOCKS:\n");
-    print(false, IR::num_nonlocals);
+    print(false, num_nonlocals);
   }
 
   if (num_locals) {
