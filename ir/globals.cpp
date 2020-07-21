@@ -10,8 +10,11 @@ using namespace std;
 
 namespace IR {
 
-unsigned num_max_nonlocals_inst;
-unsigned num_locals;
+unsigned num_locals_src;
+unsigned num_locals_tgt;
+unsigned num_consts_src;
+unsigned num_globals_src;
+unsigned num_extra_nonconst_tgt;
 unsigned num_nonlocals;
 unsigned num_nonlocals_src;
 unsigned bits_for_ptrattrs;
@@ -21,11 +24,13 @@ unsigned bits_program_pointer;
 unsigned bits_size_t;
 unsigned bits_byte;
 unsigned strlen_unroll_cnt;
+unsigned memcmp_unroll_cnt;
 bool little_endian;
 bool has_int2ptr;
 bool has_ptr2int;
 bool has_malloc;
 bool has_free;
+bool has_alloca;
 bool has_fncall;
 bool has_nocapture;
 bool has_readonly;

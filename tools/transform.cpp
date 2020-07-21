@@ -200,6 +200,9 @@ static expr preprocess(Transform &t, const set<expr> &qvars0,
   for (auto &var : qvars0) {
     if (!var.isBool())
       continue;
+    if (hit_half_memory_limit())
+      break;
+
     e = e.subst(var, true).simplify() &&
         e.subst(var, false).simplify();
     qvars.erase(var);
@@ -260,12 +263,12 @@ static expr preprocess(Transform &t, const set<expr> &qvars0,
 }
 
 
-static void check_refinement(Errors &errs, Transform &t,
-                             State &src_state, State &tgt_state,
-                             const Value *var, const Type &type,
-                             const expr &dom_a, const State::ValTy &ap,
-                             const expr &dom_b, const State::ValTy &bp,
-                             bool check_each_var) {
+static void
+check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
+                 const Value *var, const Type &type,
+                 const expr &dom_a, const expr &fndom_a, const State::ValTy &ap,
+                 const expr &dom_b, const expr &fndom_b, const State::ValTy &bp,
+                 bool check_each_var) {
   auto &a = ap.first;
   auto &b = bp.first;
 
@@ -328,8 +331,12 @@ static void check_refinement(Errors &errs, Transform &t,
 
   auto src_mem = src_state.returnMemory();
   auto tgt_mem = tgt_state.returnMemory();
-  auto [memory_cnstr, ptr_refinement0] = src_mem.refined(tgt_mem, false);
+  auto [memory_cnstr0, ptr_refinement0, mem_undef]
+    = src_mem.refined(tgt_mem, false);
   auto &ptr_refinement = ptr_refinement0;
+  auto memory_cnstr = memory_cnstr0.isTrue() ? memory_cnstr0
+                                             : value_cnstr && memory_cnstr0;
+  qvars.insert(mem_undef.begin(), mem_undef.end());
 
   if (check_expr(axioms_expr && (pre_src && pre_tgt)).isUnsat()) {
     errs.add("Precondition is always false", false);
@@ -351,17 +358,36 @@ static void check_refinement(Errors &errs, Transform &t,
   };
 
   auto print_ptr_load = [&](ostream &s, const Model &m) {
+    set<expr> undef;
     Pointer p(src_mem, m[ptr_refinement()]);
+    unsigned align = bits_byte / 8;
     s << "\nMismatch in " << p
-      << "\nSource value: " << Byte(src_mem, m[src_mem.load(p)()])
-      << "\nTarget value: " << Byte(tgt_mem, m[tgt_mem.load(p)()]);
+      << "\nSource value: " << Byte(src_mem, m[src_mem.load(p, undef, align)()])
+      << "\nTarget value: " << Byte(tgt_mem, m[tgt_mem.load(p, undef, align)()]);
   };
 
+  expr dom_constr;
+  if (dom_a.eq(fndom_a)) {
+    if (dom_b.eq(fndom_b)) // A /\ B /\ A != B
+       dom_constr = false;
+    else // A /\ B /\ A != C
+      dom_constr = fndom_a && fndom_b && !dom_b;
+  } else if (dom_b.eq(fndom_b)) { // A /\ B /\ C != B
+    dom_constr = fndom_a && fndom_b && !dom_a;
+  } else {
+    dom_constr = (fndom_a && fndom_b) && dom_a != dom_b;
+  }
+
   Solver::check({
-    { mk_fml(dom_a.notImplies(dom_b)),
+    { mk_fml(fndom_a.notImplies(fndom_b)),
       [&](const Result &r) {
         err(r, [](ostream&, const Model&){},
             "Source is more defined than target");
+      }},
+    { mk_fml(move(dom_constr)),
+      [&](const Result &r) {
+        err(r, [](ostream&, const Model&){},
+            "Source and target don't have the same return domain");
       }},
     { mk_fml(dom && !poison_cnstr),
       [&](const Result &r) {
@@ -376,13 +402,6 @@ static void check_refinement(Errors &errs, Transform &t,
         err(r, print_ptr_load, "Mismatch in memory");
       }}
   });
-}
-
-static const ConversionOp* is_bitcast(const Value &v) {
-  if (auto c = dynamic_cast<const ConversionOp*>(&v))
-    if (c->getOp() == ConversionOp::BitCast)
-      return c;
-  return nullptr;
 }
 
 static bool has_nullptr(const Value *v) {
@@ -431,14 +450,20 @@ static bool may_be_nonlocal(Value *ptr) {
       continue;
     }
 
-    if (auto c = is_bitcast(*ptr)) {
-      todo.emplace_back(&c->getValue());
+    if (auto c = isNoOp(*ptr)) {
+      todo.emplace_back(c);
       continue;
     }
 
     if (auto phi = dynamic_cast<Phi*>(ptr)) {
       for (auto &op : phi->operands())
         todo.emplace_back(op);
+      continue;
+    }
+
+    if (auto s = dynamic_cast<Select*>(ptr)) {
+      todo.emplace_back(s->getTrueValue());
+      todo.emplace_back(s->getFalseValue());
       continue;
     }
     return true;
@@ -448,212 +473,47 @@ static bool may_be_nonlocal(Value *ptr) {
   return false;
 }
 
-static unsigned returns_nonlocal(const Instr &inst) {
+static pair<Value*, uint64_t> collect_gep_offsets(Value &v) {
+  Value *ptr = &v;
+  uint64_t offset = 0;
+
+  while (true) {
+    if (auto gep = dynamic_cast<GEP*>(ptr)) {
+      uint64_t off = gep->getMaxGEPOffset();
+      if (off != UINT64_MAX) {
+        ptr = &gep->getPtr();
+        offset += off;
+        continue;
+      }
+    }
+    break;
+  }
+
+  return { ptr, offset };
+}
+
+static unsigned returns_nonlocal(const Instr &inst,
+                                 set<pair<Value*, uint64_t>> &cache) {
   bool rets_nonloc = false;
 
-  if (dynamic_cast<const FnCall *>(&inst)) {
+  if (dynamic_cast<const FnCall*>(&inst) ||
+      isCast(ConversionOp::Int2Ptr, inst)) {
     rets_nonloc = true;
   }
   else if (auto load = dynamic_cast<const Load *>(&inst)) {
-    rets_nonloc = may_be_nonlocal(&load->getPtr());
-  }
-  else if (auto conv = dynamic_cast<const ConversionOp *>(&inst)) {
-    rets_nonloc = conv->getOp() == ConversionOp::Int2Ptr;
+    if (may_be_nonlocal(&load->getPtr())) {
+      auto [ptr, offset] = collect_gep_offsets(load->getPtr());
+      rets_nonloc = cache.emplace(ptr, offset).second;
+    }
   }
   return rets_nonloc ? num_ptrs(inst.getType()) : 0;
 }
 
-static optional<int64_t> get_int(const Value &val) {
-  if (auto i = dynamic_cast<const IntConst*>(&val)) {
-    if (auto n = i->getInt())
-      return *n;
-  }
-  return {};
-}
-
-static uint64_t max_mem_access, max_alloc_size;
-
-static uint64_t get_globalvar_size(const Value *V) {
-  if (auto cast = is_bitcast(*V))
-    return get_globalvar_size(&cast->getValue());
-  if (auto glb = dynamic_cast<const GlobalVariable *>(V))
-    return glb->size();
-  return UINT64_MAX;
-}
-
-static uint64_t max_gep(const Instr &inst) {
-  if (auto conv = dynamic_cast<const ConversionOp*>(&inst)) {
-    // if addresses are observed, then expose full ptr range
-    if (conv->getOp() == ConversionOp::Int2Ptr ||
-        conv->getOp() == ConversionOp::Ptr2Int)
-      return max_mem_access = max_alloc_size = UINT64_MAX;
-  }
-
-  if (auto gep = dynamic_cast<const GEP*>(&inst)) {
-    int64_t off = 0;
-    for (auto &[mul, v] : gep->getIdxs()) {
-      if (auto n = get_int(*v)) {
-        off += mul * *n;
-        continue;
-      }
-      return UINT64_MAX;
-    }
-    return abs(off);
-  }
-  if (auto load = dynamic_cast<const Load*>(&inst)) {
-    max_mem_access = max(max_mem_access,
-                         (uint64_t)Memory::getStoreByteSize(load->getType()));
-    return 0;
-  }
-  if (auto store = dynamic_cast<const Store*>(&inst)) {
-    max_mem_access
-      = max(max_mem_access,
-            (uint64_t)Memory::getStoreByteSize(store->getValue().getType()));
-    return 0;
-  }
-  if (auto cpy = dynamic_cast<const Memcpy*>(&inst)) {
-    if (auto bytes = get_int(cpy->getBytes()))
-      max_mem_access = max(max_mem_access, (uint64_t)abs(*bytes));
-    else
-      max_mem_access = UINT64_MAX;
-    return 0;
-  }
-  if (auto memset = dynamic_cast<const Memset *>(&inst)) {
-    if (auto bytes = get_int(memset->getBytes()))
-      max_mem_access = max(max_mem_access, (uint64_t)abs(*bytes));
-    else
-      max_mem_access = UINT64_MAX;
-    return 0;
-  }
-  if (auto slen = dynamic_cast<const Strlen *>(&inst)) {
-    max_mem_access = max(max_mem_access,
-                         get_globalvar_size(slen->getPointer()));
-    return 0;
-  }
-
-  Value *size;
-  uint64_t mul = 1;
-  if (auto alloc = dynamic_cast<const Alloc*>(&inst)) {
-    size = &alloc->getSize();
-    if (alloc->getMul()) {
-      if (auto n = get_int(*alloc->getMul())) {
-        mul = *n;
-      } else {
-        max_alloc_size = UINT64_MAX;
-      }
-    }
-  } else if (auto alloc = dynamic_cast<const Malloc*>(&inst)) {
-    size = &alloc->getSize();
-  } else if (auto alloc = dynamic_cast<const Calloc*>(&inst)) {
-    size = &alloc->getSize();
-    if (auto n = get_int(alloc->getNum())) {
-      mul = *n;
-    } else {
-      max_alloc_size = UINT64_MAX;
-    }
-  } else {
-    return 0;
-  }
-
-  if (auto bytes = get_int(*size)) {
-    max_alloc_size = max(max_alloc_size, mul * abs(*bytes));
-  } else {
-    max_alloc_size = UINT64_MAX;
-  }
-  return 0;
-}
-
-static bool has_sub_byte(const Type &t) {
-  if (auto agg = t.getAsAggregateType()) {
-    if (t.isVectorType()) {
-      auto &elemTy = agg->getChild(0);
-      return elemTy.isPtrType() ? false : (elemTy.bits() % 8);
-    }
-
-    for (unsigned i = 0, e = agg->numElementsConst(); i != e;  ++i) {
-      if (has_sub_byte(agg->getChild(i)))
-        return true;
-    }
-  }
-  return false;
-}
-
-static uint64_t get_access_size(const Type &ty) {
-  if (auto agg = ty.getAsAggregateType()) {
-    uint64_t sz = 1;
-    for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
-      auto n = get_access_size(agg->getChild(i));
-      sz = i == 0 ? n : gcd(sz, n);
-    }
-    return sz;
-  }
-  if (ty.isPtrType())
-    return bits_program_pointer / 8;
-  return divide_up(ty.bits(), 8);
-}
-
-static uint64_t get_access_size(const Instr &inst) {
-  if (auto i = dynamic_cast<const Calloc*>(&inst)) {
-    does_int_mem_access = true;
-    if (auto n = get_int(i->getNum()))
-      if (auto sz = get_int(i->getSize()))
-        // assume calloc is 8 bytes aligned
-        return gcd(8, *n * *sz);
-    return 1;
-  }
-
-  if (dynamic_cast<const Strlen*>(&inst))
-    return 1;
-
-  if (auto i = dynamic_cast<const Memcpy*>(&inst)) {
-#if 0
-    if (auto bytes = get_int(i->getBytes()))
-      return gcd(gcd(i->getSrcAlign(), i->getDstAlign()), *bytes);
-#endif
-    // FIXME: memcpy doesn't have multi-byte support
-    (void)i;
-    does_ptr_mem_access = true;
-    return 1;
-  }
-
-  if (auto i = dynamic_cast<const Malloc*>(&inst)) {
-    // FIXME: memcpy doesn't have multi-byte support
-    if (i->isRealloc())
-      return 1;
-  }
-
-  if (auto i = dynamic_cast<const Memset*>(&inst)) {
-    does_int_mem_access = true;
-    if (auto bytes = get_int(i->getBytes()))
-      return gcd(i->getAlign(), *bytes);
-    return 1;
-  }
-
-  Type *value_ty;
-  unsigned align;
-  if (auto st = dynamic_cast<const Store*>(&inst)) {
-    value_ty = &st->getValue().getType();
-    align = st->getAlign();
-    does_ptr_store |= hasPtr(*value_ty);
-  } else if (auto ld = dynamic_cast<const Load*>(&inst)) {
-    value_ty = &ld->getType();
-    align = ld->getAlign();
-  } else if (auto cast = is_bitcast(inst)) {
-    value_ty = &cast->getType();
-    align = 64; // just some high value
-  } else
-    return 0;
-
-  does_ptr_mem_access |= hasPtr(*value_ty);
-  does_int_mem_access |= value_ty->enforcePtrOrVectorType().isFalse();
-
-  return gcd(align, get_access_size(*value_ty));
-}
 
 static void calculateAndInitConstants(Transform &t) {
   const auto &globals_tgt = t.tgt.getGlobalVars();
   const auto &globals_src = t.src.getGlobalVars();
-  unsigned num_globals_src = globals_src.size();
+  num_globals_src = globals_src.size();
   unsigned num_globals = num_globals_src;
 
   // FIXME: varies among address spaces
@@ -662,11 +522,22 @@ static void calculateAndInitConstants(Transform &t) {
   assert(bits_program_pointer == t.tgt.bitsPointers());
   heap_block_alignment = 8;
 
+  num_consts_src = 0;
+  num_extra_nonconst_tgt = 0;
+
+  for (auto GV : globals_src) {
+    if (GV->isConst())
+      ++num_consts_src;
+  }
+
   for (auto GVT : globals_tgt) {
     auto I = find_if(globals_src.begin(), globals_src.end(),
       [GVT](auto *GV) -> bool { return GVT->getName() == GV->getName(); });
-    if (I == globals_src.end())
+    if (I == globals_src.end()) {
       ++num_globals;
+      if (!GVT->isConst())
+        ++num_extra_nonconst_tgt;
+    }
   }
 
   unsigned num_ptrinputs = 0;
@@ -675,48 +546,19 @@ static void calculateAndInitConstants(Transform &t) {
   }
 
   // The number of instructions that can return a pointer to a non-local block.
-  num_max_nonlocals_inst = 0;
+  unsigned num_nonlocals_inst_src = 0, num_nonlocals_inst_tgt = 0;
   // The number of local blocks.
-  unsigned num_locals_src = 0, num_locals_tgt = 0;
+  num_locals_src = 0;
+  num_locals_tgt = 0;
   uint64_t max_gep_src = 0, max_gep_tgt = 0;
-  max_alloc_size = 0;
-  max_mem_access = 0;
-
-  for (auto BB : t.src.getBBs()) {
-    for (auto &i : BB->instrs()) {
-      if (returns_local(i))
-        ++num_locals_src;
-      else
-        num_max_nonlocals_inst += returns_nonlocal(i);
-      max_gep_src = add_saturate(max_gep_src, max_gep(i));
-    }
-  }
-  for (auto BB : t.tgt.getBBs()) {
-    for (auto &i : BB->instrs()) {
-      if (returns_local(i))
-        ++num_locals_tgt;
-      else
-        num_max_nonlocals_inst += returns_nonlocal(i);
-      max_gep_tgt = add_saturate(max_gep_tgt, max_gep(i));
-    }
-  }
-  num_locals = max(num_locals_src, num_locals_tgt);
-
-  uint64_t min_global_size = UINT64_MAX;
-  for (auto glbs : { &globals_src, &globals_tgt}) {
-    for (auto &glb : *glbs) {
-      auto sz = max(glb->size(), (uint64_t)1u);
-      max_mem_access = max(sz, max_mem_access);
-      min_global_size = min_global_size != UINT64_MAX
-                          ? gcd(sz, min_global_size)
-                          : sz;
-      min_global_size = gcd(min_global_size, glb->getAlignment());
-    }
-  }
+  uint64_t max_alloc_size = 0;
+  uint64_t max_access_size = 0;
 
   bool nullptr_is_used = false;
   has_int2ptr      = false;
   has_ptr2int      = false;
+  has_alloca       = false;
+  has_dead_allocas = false;
   has_malloc       = false;
   has_free         = false;
   has_fncall       = false;
@@ -730,41 +572,93 @@ static void calculateAndInitConstants(Transform &t) {
   bool does_mem_access = false;
   bool has_ptr_load = false;
   does_sub_byte_access = false;
+  bool has_vector_bitcast = false;
 
   for (auto fn : { &t.src, &t.tgt }) {
+    unsigned &cur_num_locals = fn == &t.src ? num_locals_src : num_locals_tgt;
+    uint64_t &cur_max_gep    = fn == &t.src ? max_gep_src : max_gep_tgt;
+    auto &num_nonlocals_inst = fn == &t.src ? num_nonlocals_inst_src
+                                            : num_nonlocals_inst_tgt;
+
+    for (auto &v : fn->getInputs()) {
+      auto *i = dynamic_cast<const Input *>(&v);
+      if (i && i->hasAttribute(ParamAttrs::Dereferenceable)) {
+        does_mem_access = true;
+        uint64_t deref_bytes = i->getAttributes().getDerefBytes();
+        min_access_size = gcd(min_access_size, deref_bytes);
+        max_access_size = max(max_access_size, deref_bytes);
+      }
+    }
+
+    set<pair<Value*, uint64_t>> nonlocal_cache;
     for (auto BB : fn->getBBs()) {
-      for (auto &I : BB->instrs()) {
-        for (auto op : I.operands()) {
+      for (auto &i : BB->instrs()) {
+        if (returns_local(i))
+          ++cur_num_locals;
+        else
+          num_nonlocals_inst += returns_nonlocal(i, nonlocal_cache);
+
+        for (auto op : i.operands()) {
           nullptr_is_used |= has_nullptr(op);
-          does_sub_byte_access |= has_sub_byte(op->getType());
         }
 
-        if (auto conv = dynamic_cast<const ConversionOp*>(&I)) {
-          has_int2ptr |= conv->getOp() == ConversionOp::Int2Ptr;
-          has_ptr2int |= conv->getOp() == ConversionOp::Ptr2Int;
+        if (auto *fc = dynamic_cast<const FnCall*>(&i)) {
+          has_fncall |= true;
+          has_free   |= !fc->getAttributes().has(FnAttrs::NoFree);
         }
 
-        if (auto alloc = dynamic_cast<const Alloc*>(&I))
-          has_dead_allocas |= alloc->initDead();
+        if (auto *mi = dynamic_cast<const MemInstr *>(&i)) {
+          max_alloc_size  = max(max_alloc_size, mi->getMaxAllocSize());
+          max_access_size = max(max_access_size, mi->getMaxAccessSize());
+          cur_max_gep     = add_saturate(cur_max_gep, mi->getMaxGEPOffset());
 
-        if (auto alloc = dynamic_cast<const Malloc*>(&I)) {
-          has_malloc |= true;
-          has_free |= alloc->isRealloc();
-        }
+          auto info = mi->getByteAccessInfo();
+          has_ptr_load         |= info.doesPtrLoad;
+          does_ptr_store       |= info.doesPtrStore;
+          does_int_mem_access  |= info.hasIntByteAccess;
+          does_ptr_mem_access  |= info.hasPtrByteAccess;
+          does_sub_byte_access |= info.hasSubByteAccess;
+          does_mem_access      |= info.doesMemAccess();
+          min_access_size       = gcd(min_access_size, info.byteSize);
 
-        has_malloc |= dynamic_cast<const Calloc*>(&I) != nullptr;
-        has_free   |= dynamic_cast<const Free*>(&I) != nullptr;
-        has_fncall |= dynamic_cast<const FnCall*>(&I) != nullptr;
-        if (auto *load = dynamic_cast<const Load*>(&I))
-          has_ptr_load |= hasPtr(load->getType());
+          if (auto alloc = dynamic_cast<const Alloc*>(&i)) {
+            has_alloca = true;
+            has_dead_allocas |= alloc->initDead();
+          }
+          else if (auto alloc = dynamic_cast<const Malloc*>(&i)) {
+            has_malloc  = true;
+            has_free   |= alloc->isRealloc();
+          } else {
+            has_malloc |= dynamic_cast<const Calloc*>(&i) != nullptr;
+            has_free   |= dynamic_cast<const Free*>(&i) != nullptr;
+          }
 
-        does_sub_byte_access |= has_sub_byte(I.getType());
+        } else if (isCast(ConversionOp::Int2Ptr, i) ||
+                   isCast(ConversionOp::Ptr2Int, i)) {
+          max_alloc_size = max_access_size = cur_max_gep = UINT64_MAX;
+          has_int2ptr |= isCast(ConversionOp::Int2Ptr, i) != nullptr;
+          has_ptr2int |= isCast(ConversionOp::Ptr2Int, i) != nullptr;
 
-        if (auto accsz = get_access_size(I)) {
-          min_access_size = gcd(min_access_size, accsz);
-          does_mem_access = true;
+        } else if (auto *bc = isCast(ConversionOp::BitCast, i)) {
+          auto &t = bc->getType();
+          has_vector_bitcast |= t.isVectorType();
+          does_sub_byte_access |= hasSubByte(t);
+          min_access_size = gcd(min_access_size, getCommonAccessSize(t));
         }
       }
+    }
+  }
+  unsigned num_locals = max(num_locals_src, num_locals_tgt);
+
+  uint64_t min_global_size = UINT64_MAX;
+  for (auto glbs : { &globals_src, &globals_tgt }) {
+    for (auto &glb : *glbs) {
+      auto sz = max(glb->size(), (uint64_t)1u);
+      max_access_size = max(sz, max_access_size);
+      min_global_size = min_global_size != UINT64_MAX
+                          ? gcd(sz, min_global_size)
+                          : sz;
+      min_global_size = gcd(min_global_size, glb->getAlignment());
     }
   }
 
@@ -772,6 +666,13 @@ static void calculateAndInitConstants(Transform &t) {
   // Global variables cannot be null pointers
   has_null_block = num_ptrinputs > 0 || nullptr_is_used || has_malloc ||
                   has_ptr_load || has_fncall;
+
+  // + 1 is sufficient to give 1 degree of freedom for the target to trigger UB
+  // in case a different pointer from source is produced.
+  auto num_max_nonlocals_inst
+    = max(num_nonlocals_inst_src, num_nonlocals_inst_tgt);
+  if (num_nonlocals_inst_src && num_nonlocals_inst_tgt)
+    ++num_max_nonlocals_inst;
 
   num_nonlocals_src = num_globals_src + num_ptrinputs + num_max_nonlocals_inst +
                       has_null_block;
@@ -784,7 +685,7 @@ static void calculateAndInitConstants(Transform &t) {
   if (!does_int_mem_access && !does_ptr_mem_access && has_fncall)
     does_int_mem_access = true;
 
-  auto has_attr = [&](Input::Attribute a) -> bool {
+  auto has_attr = [&](ParamAttrs::Attribute a) -> bool {
     for (auto fn : { &t.src, &t.tgt }) {
       for (auto &v : fn->getInputs()) {
         auto i = dynamic_cast<const Input*>(&v);
@@ -796,10 +697,10 @@ static void calculateAndInitConstants(Transform &t) {
   };
   // The number of bits needed to encode pointer attributes
   // nonnull and byval isn't encoded in ptr attribute bits
-  bool has_byval = has_attr(Input::ByVal);
-  has_nocapture = has_attr(Input::NoCapture);
-  has_readonly = has_attr(Input::ReadOnly);
-  has_readnone = has_attr(Input::ReadNone);
+  bool has_byval = has_attr(ParamAttrs::ByVal);
+  has_nocapture = has_attr(ParamAttrs::NoCapture);
+  has_readonly = has_attr(ParamAttrs::ReadOnly);
+  has_readnone = has_attr(ParamAttrs::ReadNone);
   bits_for_ptrattrs = has_nocapture + has_readonly + has_readnone;
 
   // ceil(log2(maxblks)) + 1 for local bit
@@ -810,7 +711,7 @@ static void calculateAndInitConstants(Transform &t) {
   // counterexamples more readable
   // Allow an extra bit for the sign
   auto max_geps
-    = ilog2_ceil(add_saturate(max(max_gep_src, max_gep_tgt), max_mem_access),
+    = ilog2_ceil(add_saturate(max(max_gep_src, max_gep_tgt), max_access_size),
                  true) + 1;
   bits_for_offset = min(round_up(max_geps, 4), (uint64_t)t.src.bitsPtrOffset());
 
@@ -820,7 +721,7 @@ static void calculateAndInitConstants(Transform &t) {
 
   // size of byte
   if (num_globals != 0) {
-    if (does_mem_access)
+    if (does_mem_access || has_vector_bitcast)
       min_access_size = gcd(min_global_size, min_access_size);
     else {
       min_access_size = min_global_size;
@@ -839,12 +740,14 @@ static void calculateAndInitConstants(Transform &t) {
                      ? (unsigned)min_access_size : 1);
 
   strlen_unroll_cnt = 10;
+  memcmp_unroll_cnt = 10;
 
   little_endian = t.src.isLittleEndian();
 
   if (config::debug)
     config::dbg() << "num_max_nonlocals_inst: " << num_max_nonlocals_inst
-                  << "\nnum_locals: " << num_locals
+                  << "\nnum_locals_src: " << num_locals_src
+                  << "\nnum_locals_tgt: " << num_locals_tgt
                   << "\nnum_nonlocals_src: " << num_nonlocals_src
                   << "\nnum_nonlocals: " << num_nonlocals
                   << "\nbits_for_bid: " << bits_for_bid
@@ -853,9 +756,10 @@ static void calculateAndInitConstants(Transform &t) {
                   << "\nbits_program_pointer: " << bits_program_pointer
                   << "\nmax_alloc_size: " << max_alloc_size
                   << "\nmin_access_size: " << min_access_size
-                  << "\nmax_mem_access: " << max_mem_access
+                  << "\nmax_access_size: " << max_access_size
                   << "\nbits_byte: " << bits_byte
                   << "\nstrlen_unroll_cnt: " << strlen_unroll_cnt
+                  << "\nmemcmp_unroll_cnt: " << memcmp_unroll_cnt
                   << "\nlittle_endian: " << little_endian
                   << "\nnullptr_is_used: " << nullptr_is_used
                   << "\nhas_int2ptr: " << has_int2ptr
@@ -864,10 +768,11 @@ static void calculateAndInitConstants(Transform &t) {
                   << "\nhas_free: " << has_free
                   << "\nhas_null_block: " << has_null_block
                   << "\ndoes_ptr_store: " << does_ptr_store
+                  << "\ndoes_mem_access: " << does_mem_access
                   << "\ndoes_ptr_mem_access: " << does_ptr_mem_access
                   << "\ndoes_int_mem_access: " << does_int_mem_access
                   << "\ndoes_sub_byte_access: " << does_sub_byte_access
-                  << "\n";
+                  << '\n';
 }
 
 
@@ -922,6 +827,7 @@ Errors TransformVerify::verify() const {
   StopWatch symexec_watch;
   calculateAndInitConstants(t);
   State::resetGlobals();
+  State::cleanup_state cleanup;
   State src_state(t.src, true), tgt_state(t.tgt, false);
 
   try {
@@ -949,7 +855,8 @@ Errors TransformVerify::verify() const {
 
       // TODO: add data-flow domain tracking for Alive, but not for TV
       check_refinement(errs, t, src_state, tgt_state, var, var->getType(),
-                       true, val, true, tgt_state.at(*tgt_instrs.at(name)),
+                       true, true, val,
+                       true, true, tgt_state.at(*tgt_instrs.at(name)),
                        check_each_var);
       if (errs)
         return errs;
@@ -957,8 +864,10 @@ Errors TransformVerify::verify() const {
   }
 
   check_refinement(errs, t, src_state, tgt_state, nullptr, t.src.getType(),
-                   src_state.returnDomain()(), src_state.returnVal(),
-                   tgt_state.returnDomain()(), tgt_state.returnVal(),
+                   src_state.returnDomain()(), src_state.functionDomain()(),
+                   src_state.returnVal(),
+                   tgt_state.returnDomain()(), tgt_state.functionDomain()(),
+                   tgt_state.returnVal(),
                    check_each_var);
 
   return errs;
@@ -1016,6 +925,119 @@ void TransformVerify::fixupTypes(const TypingAssignments &ty) {
     t.precondition->fixupTypes(ty.r.getModel());
   t.src.fixupTypes(ty.r.getModel());
   t.tgt.fixupTypes(ty.r.getModel());
+}
+
+static map<string_view, Instr*> can_remove_init(Function &fn) {
+  map<string_view, Instr*> to_remove;
+  auto &bb = fn.getFirstBB();
+  if (bb.getName() != "#init")
+    return to_remove;
+
+  bool has_int2ptr = false;
+  for (auto &i : fn.instrs()) {
+    if (isCast(ConversionOp::Int2Ptr, i)) {
+      has_int2ptr = true;
+      break;
+    }
+  }
+
+  vector<Value*> worklist;
+  set<const Value*> seen;
+  auto users = fn.getUsers();
+
+  for (auto &i : bb.instrs()) {
+    if (!dynamic_cast<const Store*>(&i))
+      continue;
+    auto gvar = i.operands()[1];
+    worklist.emplace_back(gvar);
+    seen.emplace(&i);
+
+    bool needed = false;
+    do {
+      auto user = worklist.back();
+      worklist.pop_back();
+      if (!seen.emplace(user).second)
+        continue;
+
+      // OK, we can't observe which memory it reads
+      if (dynamic_cast<FnCall*>(user))
+        continue;
+
+      if (isCast(ConversionOp::Ptr2Int, *user)) {
+        // int2ptr can potentially alias with anything, so play on the safe side
+        if (has_int2ptr) {
+          needed = true;
+          break;
+        }
+        continue;
+      }
+
+      // no useful users
+      if (dynamic_cast<ICmp*>(user) ||
+          dynamic_cast<Return*>(user))
+        continue;
+
+      if (dynamic_cast<MemInstr*>(user) && !dynamic_cast<GEP*>(user)) {
+        needed = true;
+        break;
+      }
+
+      for (auto p = users.equal_range(user); p.first != p.second; ++p.first) {
+        worklist.emplace_back(p.first->second);
+      }
+    } while (!worklist.empty());
+
+    worklist.clear();
+    seen.clear();
+
+    if (!needed)
+      to_remove.emplace(gvar->getName(), const_cast<Instr*>(&i));
+  }
+  return to_remove;
+}
+
+void Transform::preprocess() {
+  // remove store of initializers to global variables that aren't needed to
+  // verify the transformation
+  // We only remove inits if it's possible to remove from both programs to keep
+  // memories syntactically equal
+  auto remove_init_tgt = can_remove_init(tgt);
+  for (auto &[name, isrc] : can_remove_init(src)) {
+    auto Itgt = remove_init_tgt.find(name);
+    if (Itgt == remove_init_tgt.end())
+      continue;
+    src.getFirstBB().delInstr(isrc);
+    tgt.getFirstBB().delInstr(Itgt->second);
+    // TODO: check that tgt init refines that of src
+  }
+
+  // remove side-effect free instructions without users
+  vector<Instr*> to_remove;
+  for (auto fn : { &src, &tgt }) {
+    bool changed;
+    do {
+      auto users = fn->getUsers();
+      changed = false;
+
+      for (auto bb : fn->getBBs()) {
+        for (auto &i : bb->instrs()) {
+          auto i_ptr = const_cast<Instr*>(&i);
+          if (hasNoSideEffects(i) && !users.count(i_ptr))
+            to_remove.emplace_back(i_ptr);
+        }
+
+        for (auto i : to_remove) {
+          bb->delInstr(i);
+          changed = true;
+        }
+        to_remove.clear();
+      }
+
+      changed |=
+        fn->removeUnusedStuff(users, fn == &src ? vector<string_view>()
+                                                : src.getGlobalVarNames());
+    } while (changed);
+  }
 }
 
 void Transform::print(ostream &os, const TransformPrintOpts &opt) const {

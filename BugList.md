@@ -4,7 +4,7 @@ This document lists the bugs found so far by Alive2 in LLVM & Z3.
 Please contact us or submit a PR if something is missing or inaccurate.
 
 
-### Integer operations
+### Integer/Float operations
 1. Incorrect fold of 'x & (-1 >> y) s>= x'
 (https://bugs.llvm.org/show_bug.cgi?id=39861)
 
@@ -62,6 +62,15 @@ Please contact us or submit a PR if something is missing or inaccurate.
 19. InstSimplify: fadd (nsz op), +0 incorrectly removed
 (https://bugs.llvm.org/show_bug.cgi?id=45778)
 
+20. Incorrect instcombine fold of control-flow to umul.with.overflow
+(https://bugs.llvm.org/show_bug.cgi?id=45952)
+
+21. Incorrect instcombine fold of vector ult -> sgt
+(https://bugs.llvm.org/show_bug.cgi?id=45954)
+
+22. Jumpthreading introduces jump on poison
+(https://bugs.llvm.org/show_bug.cgi?id=45956)
+
 
 ### Memory Operations (Load/Store/GEP/...)
 
@@ -93,7 +102,8 @@ Please contact us or submit a PR if something is missing or inaccurate.
 (https://bugs.llvm.org/show_bug.cgi?id=44543)
 
 10. DSE not checking decl of libcalls
-(https://github.com/llvm/llvm-project/commit/87407fc03c82d880cc42330a8e230e7a48174e3c)
+(https://github.com/llvm/llvm-project/commit/87407fc03c82d880cc42330a8e230e7a48174e3c
+& https://github.com/llvm/llvm-project/commit/7f903873b8a937acec2e2cc232e70cba53061352)
 
 11. [globalopt] optimization leaves store to a constant global
 (https://bugs.llvm.org/show_bug.cgi?id=43616)
@@ -114,6 +124,11 @@ NOTE: Alive2 can't find this bug anymore due to changes to reduce false-positive
 16. gep(ptr, undef) isn't undef
 (https://bugs.llvm.org/show_bug.cgi?id=45445)
 
+17. X86InterleavedAccess introduces misaligned loads
+(https://bugs.llvm.org/show_bug.cgi?id=45957)
+
+18. load-store-vectorizer cannot assume that an offset calculated from add nuw is fine in general
+(https://bugs.llvm.org/show_bug.cgi?id=46591)
 
 ### Bugs found in Z3
 1. https://github.com/Z3Prover/z3/issues/2369 - bug in bitblast for FPA
@@ -126,3 +141,6 @@ NOTE: Alive2 can't find this bug anymore due to changes to reduce false-positive
 8. https://github.com/Z3Prover/z3/issues/2878 - crash in BV theory assertion
 9. https://github.com/Z3Prover/z3/issues/2879 - crash in SMT eq propagation assertion
 10. https://github.com/Z3Prover/z3/commit/bb5edb7c653f9351fe674630d63cdd2b10338277 - assertion violation in qe_lite
+11. https://github.com/Z3Prover/z3/issues/4192 - SMT internalize doesn't respect timeout
+12. https://github.com/Z3Prover/z3/issues/2761 - crash in printing multi precision integer
+13. https://github.com/Z3Prover/z3/issues/2652 - crash in partial model mode

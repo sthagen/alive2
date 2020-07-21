@@ -29,6 +29,15 @@ void BasicBlock::addInstr(unique_ptr<Instr> &&i) {
   m_instrs.push_back(move(i));
 }
 
+void BasicBlock::delInstr(Instr *i) {
+  for (auto I = m_instrs.begin(), E = m_instrs.end(); I != E; ++I) {
+    if (I->get() == i) {
+      m_instrs.erase(I);
+      return;
+    }
+  }
+}
+
 unique_ptr<BasicBlock> BasicBlock::dup(const string &suffix) const {
   auto newbb = make_unique<BasicBlock>(name + suffix);
   for (auto &i : instrs()) {
@@ -111,8 +120,7 @@ void Function::addConstant(unique_ptr<Value> &&c) {
 vector<GlobalVariable *> Function::getGlobalVars() const {
   vector<GlobalVariable *> gvs;
   for (auto I = constants.begin(), E = constants.end(); I != E; ++I) {
-    const unique_ptr<Value> &c = *I;
-    if (auto *gv = dynamic_cast<GlobalVariable *>(c.get()))
+    if (auto *gv = dynamic_cast<GlobalVariable*>(I->get()))
       gvs.push_back(gv);
   }
   return gvs;
@@ -122,7 +130,7 @@ vector<string_view> Function::getGlobalVarNames() const {
   vector<string_view> gvnames;
   auto gvs = getGlobalVars();
   transform(gvs.begin(), gvs.end(), back_inserter(gvnames),
-            [](auto itm) { return string_view(itm->getName()).substr(1); });
+            [](auto &itm) { return string_view(itm->getName()).substr(1); });
   return gvnames;
 }
 
@@ -191,6 +199,60 @@ void Function::instr_iterator::operator++(void) {
   next_bb();
 }
 
+multimap<Value*, Value*> Function::getUsers() const {
+  multimap<Value*, Value*> users;
+  for (auto &i : instrs()) {
+    for (auto op : i.operands()) {
+      users.emplace(op, const_cast<Instr*>(&i));
+    }
+  }
+  for (auto &agg : aggregates) {
+    for (auto val : agg->getVals()) {
+      users.emplace(val, agg.get());
+    }
+  }
+  for (auto &c : constants) {
+    if (auto agg = dynamic_cast<AggregateValue*>(c.get())) {
+      for (auto val : agg->getVals()) {
+        users.emplace(val, agg);
+      }
+    }
+  }
+  return users;
+}
+
+template <typename T>
+static bool removeUnused(T &data, const multimap<Value*, Value*> &users,
+                         const vector<string_view> &src_glbs) {
+  bool changed = false;
+  for (auto I = data.begin(); I != data.end(); ) {
+    if (users.count(I->get())) {
+      ++I;
+      continue;
+    }
+
+    // don't delete glbs in target that are used in src
+    if (auto gv = dynamic_cast<GlobalVariable*>(I->get())) {
+      auto name = string_view(gv->getName()).substr(1);
+      if (find(src_glbs.begin(), src_glbs.end(), name) != src_glbs.end()) {
+        ++I;
+        continue;
+      }
+    }
+
+    I = data.erase(I);
+    changed = true;
+  }
+  return changed;
+}
+
+bool Function::removeUnusedStuff(const multimap<Value*, Value*> &users,
+                                 const vector<string_view> &src_glbs) {
+  bool changed = removeUnused(aggregates, users, src_glbs);
+  changed |= removeUnused(constants, users, src_glbs);
+  return changed;
+}
+
 void Function::print(ostream &os, bool print_header) const {
   {
     const auto &gvars = getGlobalVars();
@@ -204,7 +266,7 @@ void Function::print(ostream &os, bool print_header) const {
   }
 
   if (print_header) {
-    os << "define " << getType() << " @" << name << '(';
+    os << "define" << attrs << ' ' << getType() << " @" << name << '(';
     bool first = true;
     for (auto &input : getInputs()) {
       if (!first)
@@ -293,6 +355,8 @@ void CFG::printDot(ostream &os) const {
 // Relies on Alive's top_sort run during llvm2alive conversion in order to
 // traverse the cfg in reverse postorder to build dominators.
 void DomTree::buildDominators() {
+  unordered_set<const BasicBlock*> visited_src;
+
   // initialization
   unsigned i = f.getBBs().size();
   for (auto &b : f.getBBs()) {
@@ -302,12 +366,20 @@ void DomTree::buildDominators() {
   // build predecessors relationship
   for (const auto &[src, tgt, instr] : cfg) {
     (void)instr;
-    doms.at(&tgt).preds.push_back(&doms.at(&src));
+    // skip back-edges
+    visited_src.insert(&src);
+    if (!visited_src.count(&tgt))
+      doms.at(&tgt).preds.push_back(&doms.at(&src));
   }
 
-  auto &entry = doms.at(&f.getFirstBB());
-  entry.dominator = &entry;
+  // make sure all tree roots have themselves as dominator
+  for (auto &[b, b_dom] : doms) {
+    (void)b;
+    if (b_dom.preds.empty())
+      b_dom.dominator = &b_dom;
+  }
 
+  // Adaptation of the algorithm in the article
   // Cooper, Keith D.; Harvey, Timothy J.; and Kennedy, Ken (2001). 
   // A Simple, Fast Dominance Algorithm
   // http://www.cs.rice.edu/~keith/EMBED/dom.pdf
@@ -337,10 +409,18 @@ void DomTree::buildDominators() {
 }
 
 DomTree::DomTreeNode* DomTree::intersect(DomTreeNode *f1, DomTreeNode *f2) {
+  auto f1_start = f1, f2_start = f2;
+
   while (f1->order != f2->order) {
-    while (f1->order < f2->order)
+    // if f1 and f2 reached diferent tree roots, then no common parent exists
+    // therefore no "dominator" exists
+    // as a convention, return the node of the tree with root at entry in these
+    // cases, dom trees for subtrees not rooted at entry will be wrong
+    if (f1 == f1->dominator && f2 == f2->dominator)
+      return &f1->bb == &f.getFirstBB() ? f1_start : f2_start;
+    while (f1->order < f2->order && f1 != f1->dominator)
       f1 = f1->dominator;
-    while (f2->order < f1->order)
+    while (f2->order < f1->order && f2 != f2->dominator)
       f2 = f2->dominator;
   }
   return f1;

@@ -8,6 +8,7 @@
 #include "util/config.h"
 #include "util/version.h"
 #include "llvm/ADT/Any.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -88,6 +89,11 @@ llvm::cl::opt<bool> opt_disable_undef_input(
   llvm::cl::desc("Alive: Assume function input cannot be undef"),
   llvm::cl::init(false));
 
+llvm::cl::list<std::string> opt_funcs(
+  "tv-func",
+  llvm::cl::desc("Name of functions to verify (without @)"),
+  llvm::cl::ZeroOrMore, llvm::cl::value_desc("function name"));
+
 llvm::cl::opt<bool> opt_debug(
   "tv-dbg",
   llvm::cl::desc("Alive: Show debug data"),
@@ -99,6 +105,11 @@ llvm::cl::opt<unsigned> opt_omit_array_size(
                   "this number"),
   llvm::cl::init(-1));
 
+llvm::cl::opt<bool> opt_io_nobuiltin(
+    "tv-io-nobuiltin",
+    llvm::cl::desc("Encode standard I/O functions as an unknown function"),
+    llvm::cl::init(false));
+
 ostream *out;
 ofstream out_file;
 string report_filename;
@@ -106,6 +117,7 @@ optional<smt::smt_initializer> smt_init;
 optional<llvm_util::initializer> llvm_util_init;
 TransformPrintOpts print_opts;
 unordered_map<string, pair<Function, unsigned>> fns;
+set<string> fnsToVerify;
 unsigned initialized = 0;
 bool showed_stats = false;
 bool report_dir_created = false;
@@ -121,6 +133,9 @@ struct TVPass final : public llvm::FunctionPass {
   bool runOnFunction(llvm::Function &F) override {
     if (F.isDeclaration())
       // This can happen at EntryExitInstrumenter pass.
+      return false;
+
+    if (!fnsToVerify.empty() && !fnsToVerify.count(F.getName().str()))
       return false;
 
     llvm::TargetLibraryInfo *TLI = nullptr;
@@ -164,6 +179,7 @@ struct TVPass final : public llvm::FunctionPass {
     Transform t;
     t.src = move(old_fn);
     t.tgt = move(I->second.first);
+    t.preprocess();
     TransformVerify verifier(t, false);
     t.print(*out, print_opts);
 
@@ -193,6 +209,8 @@ struct TVPass final : public llvm::FunctionPass {
   bool doInitialization(llvm::Module &module) override {
     if (initialized++)
       return false;
+
+    fnsToVerify.insert(opt_funcs.begin(), opt_funcs.end());
 
     if (!report_dir_created && !opt_report_dir.empty()) {
       static default_random_engine re;
@@ -236,6 +254,7 @@ struct TVPass final : public llvm::FunctionPass {
     smt::set_query_timeout(to_string(opt_smt_to));
     smt::set_memory_limit(opt_max_mem * 1024 * 1024);
     config::skip_smt = opt_smt_skip;
+    config::io_nobuiltin = opt_io_nobuiltin;
     config::symexec_print_each_value = opt_se_verbose;
     config::disable_undef_input = opt_disable_undef_input;
     config::disable_poison_input = opt_disable_poison_input;
@@ -352,9 +371,10 @@ llvmGetPassPluginInfo() {
         [](llvm::ModulePassManager &MPM) { MPM.addPass(TVInitPass()); }
       );
       PB.registerOptimizerLastEPCallback(
-        [](llvm::FunctionPassManager &FPM, llvm::PassBuilder::OptimizationLevel)
-        { FPM.addPass(TVFinalizePass()); }
-      );
+          [](llvm::ModulePassManager &MPM,
+             llvm::PassBuilder::OptimizationLevel) {
+            MPM.addPass(createModuleToFunctionPassAdaptor(TVFinalizePass()));
+          });
       auto f = [](llvm::StringRef P, llvm::Any IR) {
         static int count = 0;
         if (!out) {

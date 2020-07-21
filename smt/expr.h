@@ -134,6 +134,7 @@ public:
   bool isBasePlusOffset(expr &base, uint64_t &offset) const;
   bool isConstArray(expr &val) const;
   bool isStore(expr &array, expr &idx, expr &val) const;
+  bool isLoad(expr &array, expr &idx) const;
 
   bool isNaNCheck(expr &fp) const;
   bool isfloat2BV(expr &fp) const;
@@ -183,6 +184,11 @@ public:
   expr cttz() const;
   expr ctlz() const;
   expr ctpop() const;
+
+  expr umin(const expr &rhs) const;
+  expr umax(const expr &rhs) const;
+  expr smin(const expr &rhs) const;
+  expr smax(const expr &rhs) const;
 
   expr isNaN() const;
   expr isInf() const;
@@ -290,7 +296,7 @@ public:
 
   static expr mkIf(const expr &cond, const expr &then, const expr &els);
   static expr mkForAll(const std::set<expr> &vars, expr &&val);
-  static expr mkLambda(const std::set<expr> &vars, const expr &val);
+  static expr mkLambda(const expr &var, const expr &val);
 
   expr simplify() const;
 
@@ -327,5 +333,18 @@ public:
   friend class Solver;
   friend class Model;
 };
+
+
+#define mkIf_fold(c, a, b) \
+  mkIf_fold_fn(c, [&]() { return a; }, [&]() { return b; })
+
+template <typename T1, typename T2>
+static expr mkIf_fold_fn(const expr &cond, T1 &&a, T2 &&b) {
+  if (cond.isTrue())
+    return a();
+  if (cond.isFalse())
+    return b();
+  return expr::mkIf(cond, a(), b());
+}
 
 }

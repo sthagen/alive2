@@ -217,7 +217,7 @@ expr expr::mkQuantVar(unsigned i, Z3_sort sort) {
 
 bool expr::isBinOp(expr &a, expr &b, int z3op) const {
   if (auto app = isAppOf(z3op)) {
-    if (Z3_get_domain_size(ctx(), decl()) != 2)
+    if (Z3_get_app_num_args(ctx(), app) != 2)
       return false;
     a = Z3_get_app_arg(ctx(), app, 0);
     b = Z3_get_app_arg(ctx(), app, 1);
@@ -310,13 +310,13 @@ bool expr::isFalse() const {
 }
 
 bool expr::isZero() const {
-  C();
-  return eq(mkUInt(0, sort()));
+  uint64_t n;
+  return isUInt(n) && n == 0;
 }
 
 bool expr::isOne() const {
-  C();
-  return eq(mkUInt(1, sort()));
+  uint64_t n;
+  return isUInt(n) && n == 1;
 }
 
 bool expr::isAllOnes() const {
@@ -333,9 +333,8 @@ bool expr::isSMax() const {
 }
 
 bool expr::isSigned() const {
-  C();
   auto bit = bits() - 1;
-  return extract(bit, bit).eq(mkUInt(1, 1));
+  return extract(bit, bit).isOne();
 }
 
 unsigned expr::bits() const {
@@ -449,6 +448,15 @@ bool expr::isStore(expr &array, expr &idx, expr &val) const {
   return false;
 }
 
+bool expr::isLoad(expr &array, expr &idx) const {
+  if (auto app = isAppOf(Z3_OP_SELECT)) {
+    array = Z3_get_app_arg(ctx(), app, 0);
+    idx = Z3_get_app_arg(ctx(), app, 1);
+    return true;
+  }
+  return false;
+}
+
 bool expr::isNaNCheck(expr &fp) const {
   if (auto app = isAppOf(Z3_OP_FPA_IS_NAN)) {
     fp = Z3_get_app_arg(ctx(), app, 0);
@@ -531,6 +539,14 @@ expr expr::unop_fold(Z3_ast(*op)(Z3_context, Z3_ast)) const {
                     z3app)
 
 expr expr::operator+(const expr &rhs) const {
+  expr a, b;
+  // (concat x const) + rhs -> (concat const+rhs) if no overflow happens
+  if (rhs.isConst() && isConcat(a, b) && b.isConst()) {
+    auto rhs2 = rhs.trunc(b.bits());
+    if (rhs2.zextOrTrunc(rhs.bits()).eq(rhs) &&
+        b.add_no_uoverflow(rhs2).isTrue())
+      return a.concat(b + rhs2);
+  }
   return binopc(Z3_mk_bvadd, operator+, Z3_OP_BADD, isZero, alwaysFalse);
 }
 
@@ -641,11 +657,10 @@ expr expr::add_no_uoverflow(const expr &rhs) const {
   if (min_leading_zeros() >= 1 && rhs.min_leading_zeros() >= 1)
     return true;
 
-  int64_t n;
-  if (isInt(n))
-    return rhs.ule(-n - 1);
-  if (rhs.isInt(n))
-    return ule(-n - 1);
+  if (rhs.isConst())
+    return ule(mkInt(-1, rhs.sort()) - rhs);
+  if (isConst())
+    return rhs.add_no_uoverflow(*this);
 
   auto bw = bits();
   return (zext(1) + rhs.zext(1)).extract(bw, bw) == 0;
@@ -721,14 +736,14 @@ expr expr::lshr(const expr &rhs) const {
 
 expr expr::fshl(const expr &a, const expr &b, const expr &c) {
   C2(a);
-  auto width = mkUInt(a.bits(), a.bits());
+  auto width = mkUInt(a.bits(), a.sort());
   expr c_mod_width = c.urem(width);
   return a << c_mod_width | b.lshr(width - c_mod_width);
 }
 
 expr expr::fshr(const expr &a, const expr &b, const expr &c) {
   C2(a);
-  auto width = mkUInt(a.bits(), a.bits());
+  auto width = mkUInt(a.bits(), a.sort());
   expr c_mod_width = c.urem(width);
   return a << (width - c_mod_width) | b.lshr(c_mod_width);
 }
@@ -792,10 +807,11 @@ expr expr::bitreverse() const {
 expr expr::cttz() const {
   C();
   auto nbits = bits();
+  auto srt = sort();
 
-  auto cond = mkUInt(nbits, nbits);
+  auto cond = mkUInt(nbits, srt);
   for (int i = nbits - 1; i >= 0; --i) {
-    cond = mkIf(extract(i, i) == 1u, mkUInt(i, nbits), cond);
+    cond = mkIf(extract(i, i) == 1u, mkUInt(i, srt), cond);
   }
 
   return cond;
@@ -804,10 +820,11 @@ expr expr::cttz() const {
 expr expr::ctlz() const {
   C();
   auto nbits = bits();
+  auto srt = sort();
 
-  auto cond = mkUInt(nbits, nbits);
+  auto cond = mkUInt(nbits, srt);
   for (unsigned i = 0; i < nbits; ++i) {
-    cond = mkIf(extract(i, i) == 1u, mkUInt(nbits - 1 - i, nbits), cond);
+    cond = mkIf(extract(i, i) == 1u, mkUInt(nbits - 1 - i, srt), cond);
   }
 
   return cond;
@@ -817,12 +834,28 @@ expr expr::ctpop() const {
   C();
   auto nbits = bits();
 
-  auto res = mkUInt(0, nbits);
+  auto res = mkUInt(0, sort());
   for (unsigned i = 0; i < nbits; ++i) {
     res = res + extract(i, i).zext(nbits - 1);
   }
 
   return res;
+}
+
+expr expr::umin(const expr &rhs) const {
+  return mkIf(ule(rhs), *this, rhs);
+}
+
+expr expr::umax(const expr &rhs) const {
+  return mkIf(uge(rhs), *this, rhs);
+}
+
+expr expr::smin(const expr &rhs) const {
+  return mkIf(sle(rhs), *this, rhs);
+}
+
+expr expr::smax(const expr &rhs) const {
+  return mkIf(sge(rhs), *this, rhs);
 }
 
 expr expr::isNaN() const {
@@ -1055,8 +1088,8 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
   // (= (= a bit) (= b bit)) -> (= a b)
   {
     expr lhs_a, lhs_b, rhs_a, rhs_b;
-    if (isEq(lhs_a, lhs_b) && lhs_a.bits() == 1 && rhs.isEq(rhs_a, rhs_b) &&
-        lhs_a.eq(rhs_a))
+    if (isEq(lhs_a, lhs_b) && lhs_a.isBV() && lhs_a.bits() == 1 &&
+        rhs.isEq(rhs_a, rhs_b) && lhs_a.eq(rhs_a))
       return lhs_b == rhs_b;
   }
 
@@ -1107,17 +1140,12 @@ expr expr::cmp_eq(const expr &rhs, bool simplify) const {
   {
     expr c, t, e;
     if (isIf(c, t, e)) {
-#if 0
-      // TODO: benchmark
-      // (= (ite c t e) (ite c x y)) -> (ite c (= t x) (= e y))
-      if (auto rhs_app = rhs.isAppOf(Z3_OP_ITE)) {
-        expr c2 = Z3_get_app_arg(ctx(), rhs_app, 0);
-        if (c.eq(c2))
-          return mkIf(c,
-                      t == Z3_get_app_arg(ctx(), rhs_app, 1),
-                      e == Z3_get_app_arg(ctx(), rhs_app, 2));
-      }
-#endif
+      // (= (ite c t e) (ite c2 t e)) -> c == c2
+      expr c2, t2, e2;
+      if (rhs.isIf(c2, t2, e2) && t.eq(t2) && e.eq(e2) && !t.eq(e) &&
+          t.isConst() && e.isConst())
+        return c == c2;
+
       // (= (ite c t e) x) -> (ite c (= t x) (= e x))
       if (rhs.isConst() || (t.isConst() && e.isConst()))
         return mkIf(c, t == rhs, e == rhs);
@@ -1140,23 +1168,23 @@ expr expr::operator!=(const expr &rhs) const {
 }
 
 expr expr::operator&&(const expr &rhs) const {
-  C(rhs);
   if (eq(rhs) || isFalse() || rhs.isTrue())
     return *this;
   if (isTrue() || rhs.isFalse())
     return rhs;
 
+  C(rhs);
   Z3_ast args[] = { ast(), rhs() };
   return Z3_mk_and(ctx(), 2, args);
 }
 
 expr expr::operator||(const expr &rhs) const {
-  C(rhs);
   if (eq(rhs) || rhs.isFalse() || isTrue())
     return *this;
   if (rhs.isTrue() || isFalse())
     return rhs;
 
+  C(rhs);
   Z3_ast args[] = { ast(), rhs() };
   return Z3_mk_or(ctx(), 2, args);
 }
@@ -1322,10 +1350,29 @@ expr expr::zextOrTrunc(unsigned tobw) const {
 }
 
 expr expr::concat(const expr &rhs) const {
-  expr a, b;
+  expr a, b, c, d;
   unsigned h, l, h2, l2;
-  if (isExtract(a, h, l) && rhs.isExtract(b, h2, l2) && a.eq(b) && l == h2+1)
-    return a.extract(h, l2);
+  if (isExtract(a, h, l)) {
+    if (rhs.isExtract(b, h2, l2) && l == h2+1) {
+      if (a.eq(b))
+        return a.extract(h, l2);
+
+      // (concat (extract (concat const X)) (extract X))
+      expr aa, ab;
+      if (l2 == 0 && a.isConcat(aa, ab) && ab.eq(b) &&
+          (h - aa.bits()) == b.bits())
+        return aa.concat(b);
+    }
+
+    //  extract_l concat (concat extract_r foo)
+    if (rhs.isConcat(b, c) && b.isExtract(d, h2, l2) && l == h2+1 && a.eq(d))
+      return a.extract(h, l2).concat(c);
+  }
+
+  // (concat (concat x extract) extract)
+  if (isConcat(a, b) && b.isExtract(c, h, l) && rhs.isExtract(d, h2, l2) &&
+      l == h2+1 && c.eq(d))
+    return a.concat(c.extract(h, l2));
 
   return binop_fold(rhs, Z3_mk_concat);
 }
@@ -1498,15 +1545,13 @@ expr expr::load(const expr &idx) const {
     if (body.isConst())
       return body;
 
-    auto extract_load = [&idx](expr &e, const expr &var) {
-      if (auto app = e.isAppOf(Z3_OP_SELECT)) { // load(array, idx)
-        expr lambda_idx = Z3_get_app_arg(ctx(), app, 1);
-        expr new_idx = lambda_idx.subst(var, idx).simplify();
-        assert(!idx.isValid() || !lambda_idx.eq(new_idx));
-        e = expr(Z3_get_app_arg(ctx(), app, 0)).load(new_idx);
-        return true;
+    auto subst = [&](const expr &e, const expr &var) {
+      if (e.isLoad(array, str_idx)) {
+        expr new_idx = str_idx.subst(var, idx).simplify();
+        assert(!idx.isValid() || !str_idx.eq(new_idx));
+        return array.load(new_idx);
       }
-      return false;
+      return e.subst(var, idx);
     };
 
     expr cond, then, els;
@@ -1514,18 +1559,7 @@ expr expr::load(const expr &idx) const {
       auto sort = Z3_get_quantifier_bound_sort(ctx(), ast(), 0);
       expr var = expr::mkQuantVar(0, sort);
       cond = cond.subst(var, idx).simplify();
-      if (cond.isTrue()) {
-        if (then.isConst())
-          return then;
-        if (extract_load(then, var))
-          return then;
-      }
-      if (cond.isFalse()) {
-        if (els.isConst())
-          return els;
-        if (extract_load(els, var))
-          return els;
-      }
+      return mkIf_fold(cond, subst(then, var), subst(els, var));
     }
   }
 
@@ -1578,21 +1612,17 @@ expr expr::mkForAll(const set<expr> &vars, expr &&val) {
                             val());
 }
 
-expr expr::mkLambda(const set<expr> &vars, const expr &val) {
-  C2(val);
-  assert(!vars.empty());
-
-  unique_ptr<Z3_app[]> vars_ast(new Z3_app[vars.size()]);
-  unsigned i = 0;
-  for (auto &v : vars) {
-    vars_ast[i++] = (Z3_app)v();
-  }
-  return Z3_mk_lambda_const(ctx(), vars.size(), vars_ast.get(), val());
+expr expr::mkLambda(const expr &var, const expr &val) {
+  C2(var, val);
+  auto ast = (Z3_app)var();
+  return Z3_mk_lambda_const(ctx(), 1, &ast, val());
 }
 
 expr expr::simplify() const {
   C();
-  return Z3_simplify(ctx(), ast());
+  auto e = Z3_simplify(ctx(), ast());
+  // Z3_simplify returns null on timeout
+  return e ? e : *this;
 }
 
 expr expr::subst(const vector<pair<expr, expr>> &repls) const {

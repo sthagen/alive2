@@ -1,4 +1,4 @@
-; TEST-ARGS: -disable-undef-input -smt-to=15000
+; TEST-ARGS: -disable-undef-input
 
 define void @src(i32 %a, i32 %b, {i32, i1}* %p) {
   %mul = call { i32, i1 } @llvm.umul.with.overflow.i32(i32 %a, i32 %b)

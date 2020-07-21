@@ -66,6 +66,10 @@ static llvm::cl::opt<bool> opt_smt_verbose(
     "smt-verbose", llvm::cl::desc("SMT verbose mode"),
     llvm::cl::cat(opt_alive), llvm::cl::init(false));
 
+static llvm::cl::opt<bool> opt_smt_skip(
+    "skip-smt", llvm::cl::desc("Skip all SMT queries"),
+    llvm::cl::cat(opt_alive), llvm::cl::init(false));
+
 static llvm::cl::list<std::string> opt_funcs(
     "func",
     llvm::cl::desc("Specify the name of a function to verify (without @)"),
@@ -93,6 +97,11 @@ static llvm::cl::opt<unsigned> opt_omit_array_size(
     llvm::cl::desc("Omit an array initializer if it has elements more than "
                    "this number"),
     llvm::cl::cat(opt_alive), llvm::cl::init(-1));
+
+static llvm::cl::opt<bool> opt_io_nobuiltin(
+    "io-nobuiltin",
+    llvm::cl::desc("Encode standard I/O functions as an unknown function"),
+    llvm::cl::cat(opt_alive), llvm::cl::init(false));
 
 static llvm::cl::opt<unsigned> opt_max_mem(
      "max-mem", llvm::cl::desc("Max memory (approx)"),
@@ -264,6 +273,7 @@ static void compareFunctions(llvm::Function &F1, llvm::Function &F2,
   Transform t;
   t.src = move(*Func1);
   t.tgt = move(*Func2);
+  t.preprocess();
   TransformVerify verifier(t, false);
   if (!opt_succinct)
     t.print(cout, print_opts);
@@ -388,7 +398,8 @@ convenient way to demonstrate an existing optimizer bug.
   smt::solver_tactic_verbose(opt_tactic_verbose);
   smt::set_query_timeout(to_string(opt_smt_to));
   smt::set_memory_limit((uint64_t)opt_max_mem * 1024 * 1024);
-  //config::skip_smt = opt_smt_skip;
+  config::skip_smt = opt_smt_skip;
+  config::io_nobuiltin = opt_io_nobuiltin;
   config::symexec_print_each_value = opt_se_verbose;
   config::disable_undef_input = opt_disable_undef;
   config::disable_poison_input = opt_disable_poison;
@@ -445,9 +456,7 @@ convenient way to demonstrate an existing optimizer bug.
   }
 
   {
-  set<string> funcNames;
-  for (const string &fnname: opt_funcs)
-    funcNames.insert(fnname);
+  set<string> funcNames(opt_funcs.begin(), opt_funcs.end());
 
   auto targetTriple = llvm::Triple(M1.get()->getTargetTriple());
   // FIXME: quadratic, may not be suitable for very large modules

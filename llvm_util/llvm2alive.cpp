@@ -249,58 +249,107 @@ public:
     if (!ty)
       return error(i);
 
-    unsigned flags = 0;
-    if (i.hasFnAttr(llvm::Attribute::ReadOnly))
-      flags |= FnCall::NoWrite;
-    if (i.hasFnAttr(llvm::Attribute::ReadNone))
-      flags |= FnCall::NoRead | FnCall::NoWrite;
+    FnAttrs attrs;
+    if (i.hasFnAttr(llvm::Attribute::ReadOnly)) {
+      attrs.set(FnAttrs::NoWrite);
+      attrs.set(FnAttrs::NoFree);
+    }
+    if (i.hasFnAttr(llvm::Attribute::ReadNone)) {
+      attrs.set(FnAttrs::NoRead);
+      attrs.set(FnAttrs::NoWrite);
+      attrs.set(FnAttrs::NoFree);
+    }
     if (i.hasFnAttr(llvm::Attribute::WriteOnly))
-      flags |= FnCall::NoRead;
+      attrs.set(FnAttrs::NoRead);
     if (i.hasFnAttr(llvm::Attribute::ArgMemOnly))
-      flags |= FnCall::ArgMemOnly;
+      attrs.set(FnAttrs::ArgMemOnly);
+    if (i.hasFnAttr(llvm::Attribute::NoReturn))
+      attrs.set(FnAttrs::NoReturn);
+    if (i.hasFnAttr(llvm::Attribute::NoFree))
+      attrs.set(FnAttrs::NoFree);
     if (auto op = dyn_cast<llvm::FPMathOperator>(&i)) {
       if (op->hasNoNaNs())
-        flags |= FnCall::NNaN;
+        attrs.set(FnAttrs::NNaN);
     }
+    const auto &ret = llvm::AttributeList::ReturnIndex;
+    if (uint64_t b = max(i.getDereferenceableBytes(ret),
+                         i.getCalledFunction()->getDereferenceableBytes(ret))) {
+      attrs.set(FnAttrs::Dereferenceable);
+      attrs.setDerefBytes(b);
+    }
+    if (i.hasRetAttr(llvm::Attribute::NonNull))
+      attrs.set(FnAttrs::NonNull);
 
     string fn_name = '@' + fn->getName().str();
-    auto call = make_unique<FnCall>(*ty, value_name(i), move(fn_name), flags,
-                                    !known);
+    auto call =
+      make_unique<FnCall>(*ty, value_name(i), move(fn_name), move(attrs),
+                          !known);
     unique_ptr<Instr> ret_val;
-    auto argI = fn->arg_begin(), argE = fn->arg_end();
-    for (auto &arg : args) {
-      unsigned attr = FnCall::ArgNone;
-      if (argI != argE) {
-        // Check whether arg itr finished early because it was var arg
-        if (argI->hasByValAttr())
-          attr |= FnCall::ArgByVal;
-        else if (argI->hasReturnedAttr()) {
-          auto call2
-            = make_unique<FnCall>(Type::voidTy, "", string(call->getFnName()),
-                                  flags, !known);
-          for (auto &[arg, flags] : call->getArgs()) {
-            call2->addArg(*arg, flags);
-          }
-          call = move(call2);
 
-          // fn may have different type than argument. LLVM assumes there's
-          // an implicit bitcast
-          assert(!ret_val);
-          if (argI->getType() == i.getType())
-            ret_val = make_unique<UnaryOp>(*ty, value_name(i), *arg,
-                                           UnaryOp::Copy);
-          else
-            ret_val = make_unique<ConversionOp>(*ty, value_name(i), *arg,
-                                                ConversionOp::BitCast);
-        }
-        ++argI;
+    // avoid parsing arguments altogether for "unknown known" functions
+    if (known)
+      goto end;
+
+    for (uint64_t argidx = 0, nargs = i.arg_size(); argidx < nargs; ++argidx) {
+      auto *arg = args[argidx];
+      ParamAttrs attr;
+      // TODO: Once attributes at a call site are fully supported, we should
+      // call handleAttributes().
+
+      if (i.paramHasAttr(argidx, llvm::Attribute::Dereferenceable)) {
+        attr.set(ParamAttrs::Dereferenceable);
+
+        uint64_t derefb = 0;
+        // dereferenceable at caller
+        if (i.getAttributes()
+             .hasParamAttr(argidx, llvm::Attribute::Dereferenceable))
+          derefb = i.getParamAttr(argidx, llvm::Attribute::Dereferenceable)
+                    .getDereferenceableBytes();
+        if (argidx < i.getCalledFunction()->arg_size())
+          derefb = max(derefb,
+              i.getCalledFunction()->getParamDereferenceableBytes(argidx));
+        assert(derefb);
+        attr.setDerefBytes(derefb);
       }
-      call->addArg(*arg, attr);
+
+      if (i.paramHasAttr(argidx, llvm::Attribute::ByVal)) {
+        // A byval parameter cannot be captured.
+        attr.set(ParamAttrs::NoCapture);
+        attr.set(ParamAttrs::ByVal);
+      }
+
+      if (i.paramHasAttr(argidx, llvm::Attribute::NoCapture))
+        attr.set(ParamAttrs::NoCapture);
+
+      if (i.paramHasAttr(argidx, llvm::Attribute::NonNull))
+        attr.set(ParamAttrs::NonNull);
+
+      if (i.paramHasAttr(argidx, llvm::Attribute::Returned)) {
+        auto call2
+          = make_unique<FnCall>(Type::voidTy, "", string(call->getFnName()),
+                                FnAttrs(call->getAttributes()), !known);
+        for (auto &[arg, flags] : call->getArgs()) {
+          call2->addArg(*arg, ParamAttrs(flags));
+        }
+        call = move(call2);
+
+        // fn may have different type than argument. LLVM assumes there's
+        // an implicit bitcast
+        assert(!ret_val);
+        if (i.getArgOperand(argidx)->getType() == i.getType())
+          ret_val = make_unique<UnaryOp>(*ty, value_name(i), *arg,
+                                          UnaryOp::Copy);
+        else
+          ret_val = make_unique<ConversionOp>(*ty, value_name(i), *arg,
+                                              ConversionOp::BitCast);
+      }
+      call->addArg(*arg, move(attr));
     }
     if (ret_val) {
       BB->addInstr(move(call));
       RETURN_IDENTIFIER(move(ret_val));
     }
+end:
     RETURN_IDENTIFIER(move(call));
   }
 
@@ -646,8 +695,7 @@ public:
     case llvm::Intrinsic::bswap:
     case llvm::Intrinsic::ctpop:
     case llvm::Intrinsic::expect:
-    case llvm::Intrinsic::is_constant:
-    {
+    case llvm::Intrinsic::is_constant: {
       PARSE_UNOP();
       UnaryOp::Op op;
       switch (i.getIntrinsicID()) {
@@ -659,6 +707,31 @@ public:
       default: UNREACHABLE();
       }
       RETURN_IDENTIFIER(make_unique<UnaryOp>(*ty, value_name(i), *val, op));
+    }
+    case llvm::Intrinsic::experimental_vector_reduce_add:
+    case llvm::Intrinsic::experimental_vector_reduce_mul:
+    case llvm::Intrinsic::experimental_vector_reduce_and:
+    case llvm::Intrinsic::experimental_vector_reduce_or:
+    case llvm::Intrinsic::experimental_vector_reduce_xor:
+    case llvm::Intrinsic::experimental_vector_reduce_smax:
+    case llvm::Intrinsic::experimental_vector_reduce_smin:
+    case llvm::Intrinsic::experimental_vector_reduce_umax:
+    case llvm::Intrinsic::experimental_vector_reduce_umin: {
+      PARSE_UNOP();
+      UnaryReductionOp::Op op;
+      switch (i.getIntrinsicID()) {
+      case llvm::Intrinsic::experimental_vector_reduce_add: op = UnaryReductionOp::Add; break;
+      case llvm::Intrinsic::experimental_vector_reduce_mul: op = UnaryReductionOp::Mul; break;
+      case llvm::Intrinsic::experimental_vector_reduce_and: op = UnaryReductionOp::And; break;
+      case llvm::Intrinsic::experimental_vector_reduce_or:  op = UnaryReductionOp::Or;  break;
+      case llvm::Intrinsic::experimental_vector_reduce_xor: op = UnaryReductionOp::Xor; break;
+      case llvm::Intrinsic::experimental_vector_reduce_smax: op = UnaryReductionOp::SMax; break;
+      case llvm::Intrinsic::experimental_vector_reduce_smin: op = UnaryReductionOp::SMin; break;
+      case llvm::Intrinsic::experimental_vector_reduce_umax: op = UnaryReductionOp::UMax; break;
+      case llvm::Intrinsic::experimental_vector_reduce_umin: op = UnaryReductionOp::UMin; break;
+      default: UNREACHABLE();
+      }
+      RETURN_IDENTIFIER(make_unique<UnaryReductionOp>(*ty, value_name(i), *val, op));
     }
     case llvm::Intrinsic::fshl:
     case llvm::Intrinsic::fshr:
@@ -753,6 +826,7 @@ public:
       case LLVMContext::MD_range:
       {
         Value *range = nullptr;
+        auto &boolTy = get_int_type(1);
         for (unsigned op = 0, e = Node->getNumOperands(); op < e; ++op) {
           auto *low =
             llvm::mdconst::extract<llvm::ConstantInt>(Node->getOperand(op));
@@ -760,17 +834,19 @@ public:
             llvm::mdconst::extract<llvm::ConstantInt>(Node->getOperand(++op));
 
           auto op_name = to_string(op / 2);
-          auto l = make_unique<ICmp>(get_int_type(1),
+          auto l = make_unique<ICmp>(boolTy,
                                      "%range_l#" + op_name + value_name(llvm_i),
                                      ICmp::SGE, i, *get_operand(low));
 
-          auto h = make_unique<ICmp>(get_int_type(1),
+          auto h = make_unique<ICmp>(boolTy,
                                      "%range_h#" + op_name + value_name(llvm_i),
                                      ICmp::SLT, i, *get_operand(high));
 
-          auto r = make_unique<BinOp>(get_int_type(1),
+          bool wrap = low->getValue().sgt(high->getValue());
+          auto r = make_unique<BinOp>(boolTy,
                                       "%range#" + op_name + value_name(llvm_i),
-                                      *l.get(), *h.get(), BinOp::And);
+                                      *l.get(), *h.get(),
+                                      wrap ? BinOp::Or : BinOp::And);
 
           auto r_ptr = r.get();
           BB->addInstr(move(l));
@@ -778,7 +854,7 @@ public:
           BB->addInstr(move(r));
 
           if (range) {
-            auto range_or = make_unique<BinOp>(get_int_type(1),
+            auto range_or = make_unique<BinOp>(boolTy,
                                                "$rangeOR$" + op_name +
                                                  value_name(llvm_i),
                                                *range, *r_ptr, BinOp::Or);
@@ -813,8 +889,8 @@ public:
     return true;
   }
 
-  optional<unsigned> handleAttributes(llvm::Argument &arg) {
-    unsigned attrs = 0;
+  optional<ParamAttrs> handleAttributes(llvm::Argument &arg) {
+    ParamAttrs attrs;
     for (auto &attr : arg.getParent()->getAttributes()
                          .getParamAttributes(arg.getArgNo())) {
       switch (attr.getKindAsEnum()) {
@@ -826,28 +902,33 @@ public:
         continue;
 
       case llvm::Attribute::ByVal:
-        attrs |= Input::ByVal;
+        attrs.set(ParamAttrs::ByVal);
         continue;
 
       case llvm::Attribute::NonNull:
-        attrs |= Input::NonNull;
+        attrs.set(ParamAttrs::NonNull);
         continue;
 
       case llvm::Attribute::NoCapture:
-        attrs |= Input::NoCapture;
+        attrs.set(ParamAttrs::NoCapture);
         continue;
 
       case llvm::Attribute::ReadOnly:
-        attrs |= Input::ReadOnly;
+        attrs.set(ParamAttrs::ReadOnly);
         continue;
 
       case llvm::Attribute::ReadNone:
-        attrs |= Input::ReadNone;
+        attrs.set(ParamAttrs::ReadNone);
+        continue;
+
+      case llvm::Attribute::Dereferenceable:
+        attrs.set(ParamAttrs::Dereferenceable);
+        attrs.setDerefBytes(attr.getDereferenceableBytes());
         continue;
 
       default:
         *out << "ERROR: Unsupported attribute: " << attr.getAsString() << '\n';
-        return {};
+        return nullopt;
       }
     }
     return attrs;
@@ -856,6 +937,13 @@ public:
   optional<Function> run() {
     constexpr_idx = 0;
     copy_idx = 0;
+
+    // don't even bother if number of BBs or instructions is huge..
+    if (distance(f.begin(), f.end()) > 5000 ||
+        f.getInstructionCount() > 10000) {
+      *out << "ERROR: Function is too large\n";
+      return {};
+    }
 
     auto type = llvm_type2alive(f.getReturnType());
     if (!type)
@@ -870,10 +958,22 @@ public:
       auto attrs = handleAttributes(arg);
       if (!ty || !attrs)
         return {};
-      auto val = make_unique<Input>(*ty, value_name(arg), *attrs);
+      auto val = make_unique<Input>(*ty, value_name(arg), move(*attrs));
       add_identifier(arg, *val.get());
       Fn.addInput(move(val));
     }
+
+    auto &attrs = Fn.getFnAttrs();
+    if (f.hasFnAttribute(llvm::Attribute::NoFree))
+      attrs.set(FnAttrs::NoFree);
+
+    const auto &ridx = llvm::AttributeList::ReturnIndex;
+    if (uint64_t b = f.getDereferenceableBytes(ridx)) {
+      attrs.set(FnAttrs::Dereferenceable);
+      attrs.setDerefBytes(b);
+    }
+    if (f.hasAttribute(ridx, llvm::Attribute::NonNull))
+      attrs.set(FnAttrs::NonNull);
 
     // create all BBs upfront in topological order
     vector<pair<BasicBlock*, llvm::BasicBlock*>> sorted_bbs;
@@ -986,7 +1086,7 @@ public:
       auto storedval = get_operand(gv->getInitializer());
       if (!storedval) {
         *out << "ERROR: Unsupported constant: " << *gv->getInitializer()
-             << "\n";
+             << '\n';
         return {};
       }
 

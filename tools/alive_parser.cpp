@@ -527,9 +527,9 @@ static Value& parse_operand(Type &type) {
   case LSQBRACKET:
     return parse_aggregate_constant(type, RSQBRACKET);
   case TRUE:
-    return get_constant(1, type);
+    return get_constant(1, *int_types[1]);
   case FALSE:
-    return get_constant(0, type);
+    return get_constant(0, *int_types[1]);
   case UNDEF: {
     auto val = make_unique<UndefValue>(type);
     auto ret = val.get();
@@ -753,6 +753,30 @@ static unique_ptr<Instr> parse_unaryop(string_view name, token op_token) {
   return make_unique<UnaryOp>(ty, string(name), a, op);
 }
 
+static unique_ptr<Instr> parse_unary_reduction_op(string_view name,
+                                                  token op_token) {
+  UnaryReductionOp::Op op;
+  switch (op_token) {
+  case REDUCE_ADD: op = UnaryReductionOp::Add; break;
+  case REDUCE_MUL: op = UnaryReductionOp::Mul; break;
+  case REDUCE_AND: op = UnaryReductionOp::And; break;
+  case REDUCE_OR:  op = UnaryReductionOp::Or;  break;
+  case REDUCE_XOR: op = UnaryReductionOp::Xor; break;
+  case REDUCE_SMAX: op = UnaryReductionOp::SMax; break;
+  case REDUCE_SMIN: op = UnaryReductionOp::SMin; break;
+  case REDUCE_UMAX: op = UnaryReductionOp::UMax; break;
+  case REDUCE_UMIN: op = UnaryReductionOp::UMin; break;
+  default: UNREACHABLE();
+  }
+
+  auto &op_ty = parse_type();
+  auto &ty =
+      op_ty.isVectorType() ? op_ty.getAsAggregateType()->getChild(0) : op_ty;
+
+  auto &a = parse_operand(op_ty);
+  return make_unique<UnaryReductionOp>(ty, string(name), a, op);
+}
+
 static unique_ptr<Instr> parse_ternary(string_view name, token op_token) {
   auto fmath = parse_fast_math(op_token);
 
@@ -937,7 +961,7 @@ static unique_ptr<Instr> parse_call(string_view name) {
   auto fn_name = parse_global_name();
   tokenizer.ensure(LPAREN);
 
-  auto call = make_unique<FnCall>(ret_ty, string(name), move(fn_name));
+  vector<Value*> args;
   bool first = true;
 
   while (tokenizer.peek() != RPAREN) {
@@ -945,9 +969,27 @@ static unique_ptr<Instr> parse_call(string_view name) {
       tokenizer.ensure(COMMA);
     first = false;
     auto &ty = parse_type();
-    call->addArg(parse_operand(ty), FnCall::ArgNone);
+    args.emplace_back(&parse_operand(ty));
   }
   tokenizer.ensure(RPAREN);
+
+  FnAttrs attrs;
+  while (true) {
+    switch (auto t = *tokenizer) {
+    case NOREAD:  attrs.set(FnAttrs::NoRead); break;
+    case NOWRITE: attrs.set(FnAttrs::NoWrite); break;
+    default:
+      tokenizer.unget(t);
+      goto exit;
+    }
+  }
+exit:
+  auto call = make_unique<FnCall>(ret_ty, string(name), move(fn_name),
+                                  move(attrs));
+
+  for (auto arg : args) {
+    call->addArg(*arg, ParamAttrs::None);
+  }
   return call;
 }
 
@@ -1046,6 +1088,16 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case CTPOP:
   case FNEG:
     return parse_unaryop(name, t);
+  case REDUCE_ADD:
+  case REDUCE_MUL:
+  case REDUCE_AND:
+  case REDUCE_OR:
+  case REDUCE_XOR:
+  case REDUCE_SMAX:
+  case REDUCE_SMIN:
+  case REDUCE_UMAX:
+  case REDUCE_UMIN:
+    return parse_unary_reduction_op(name, t);
   case FSHL:
   case FSHR:
   case FMA:
@@ -1107,6 +1159,13 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   UNREACHABLE();
 }
 
+static unique_ptr<Instr> parse_assume(bool if_non_poison) {
+  tokenizer.ensure(LPAREN);
+  auto &val = parse_operand(*int_types[1].get());
+  tokenizer.ensure(RPAREN);
+  return make_unique<Assume>(val, if_non_poison);
+}
+
 static unique_ptr<Instr> parse_return() {
   auto &type = parse_type();
   auto &val = parse_operand(type);
@@ -1120,6 +1179,12 @@ static void parse_fn(Function &f) {
 
   while (true) {
     switch (auto t = *tokenizer) {
+    case ASSUME:
+      bb->addInstr(parse_assume(false));
+      break;
+    case ASSUME_NON_POISON:
+      bb->addInstr(parse_assume(true));
+      break;
     case LABEL:
       bb = &f.getBB(yylval.str);
       break;

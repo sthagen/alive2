@@ -38,7 +38,7 @@ State::State(Function &f, bool source)
     return_val(f.getType().getDummyValue(false)), return_memory(memory) {}
 
 void State::resetGlobals() {
-  Memory::resetBids(has_null_block);
+  Memory::resetBids(has_null_block, true);
 }
 
 const StateValue& State::exec(const Value &v) {
@@ -84,6 +84,7 @@ const StateValue& State::operator[](const Value &val) {
     undef_vars.emplace(move(p.second));
   }
 
+  assert(i_tmp_values < tmp_values.size());
   return tmp_values[i_tmp_values++] = move(sval_new);
 }
 
@@ -182,6 +183,7 @@ void State::addReturn(const StateValue &val) {
   return_val.add(val, domain.path);
   return_memory.add(memory, domain.path);
   return_domain.add(domain());
+  function_domain.add(domain());
   return_undef_vars.insert(undef_vars.begin(), undef_vars.end());
   return_undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
   undef_vars.clear();
@@ -189,8 +191,9 @@ void State::addReturn(const StateValue &val) {
 }
 
 void State::addUB(expr &&ub) {
+  bool isconst = ub.isConst();
   domain.UB.add(move(ub));
-  if (!ub.isConst())
+  if (!isconst)
     domain.undef_vars.insert(undef_vars.begin(), undef_vars.end());
 }
 
@@ -201,32 +204,47 @@ void State::addUB(const expr &ub) {
 }
 
 void State::addUB(AndExpr &&ubs) {
-  domain.UB.add(ubs);
-  domain.undef_vars.insert(undef_vars.begin(), undef_vars.end());
+  bool isconst = ubs.isTrue();
+  domain.UB.add(move(ubs));
+  if (!isconst)
+    domain.undef_vars.insert(undef_vars.begin(), undef_vars.end());
 }
 
-const vector<StateValue>
+void State::addNoReturn() {
+  function_domain.add(domain());
+  return_undef_vars.insert(undef_vars.begin(), undef_vars.end());
+  return_undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
+  undef_vars.clear();
+  addUB(expr(false));
+}
+
+vector<StateValue>
 State::addFnCall(const string &name, vector<StateValue> &&inputs,
-                 vector<pair<StateValue, bool>> &&ptr_inputs,
-                 const vector<Type*> &out_types, bool reads_memory,
-                 bool writes_memory, bool argmemonly) {
+                 vector<Memory::PtrInput> &&ptr_inputs,
+                 const vector<Type*> &out_types, const FnAttrs &attrs) {
   // TODO: handle changes to memory due to fn call
   // TODO: can read/write=false fn calls be removed?
 
-  expr all_args_np(true);
+  bool reads_memory = !attrs.has(FnAttrs::NoRead);
+  bool writes_memory = !attrs.has(FnAttrs::NoWrite);
+  bool argmemonly = attrs.has(FnAttrs::ArgMemOnly);
+
   bool all_valid = true;
   for (auto &v : inputs) {
-    all_args_np &= v.non_poison;
     all_valid &= v.isValid();
   }
   for (auto &v : ptr_inputs) {
-    all_args_np &= v.first.non_poison;
-    all_valid &= v.first.isValid();
+    all_valid &= v.val.isValid();
   }
 
   if (!all_valid) {
     addUB(expr());
     return vector<StateValue>(out_types.size());
+  }
+
+  for (auto &v : ptr_inputs) {
+    if (!v.nocapture && !v.val.non_poison.isFalse())
+      memory.escapeLocalPtr(v.val.value);
   }
 
   // TODO: this doesn't need to compare the full memory, just a subset of fields
@@ -253,11 +271,14 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
                           expr::mkFreshVar(npname.c_str(), false));
     }
 
-    string ub_name = string(name) + "#ub";
-    I->second = { move(values), expr::mkFreshVar(ub_name.c_str(), false),
-                  writes_memory
-                  ? memory.mkCallState(argmemonly ? &I->first.args_ptr : nullptr)
-                  : Memory::CallState(), true };
+    string ub_name = name + "#ub";
+    I->second
+      = { move(values), expr::mkFreshVar(ub_name.c_str(), false),
+          writes_memory
+            ? memory.mkCallState(argmemonly ? &I->first.args_ptr : nullptr,
+                               attrs.has(FnAttrs::NoFree))
+            : Memory::CallState(),
+          true };
   } else {
     I->second.used = true;
   }
@@ -267,21 +288,7 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
   if (writes_memory)
     memory.setState(I->second.callstate);
 
-  if (all_args_np.isTrue())
-    return I->second.retvals;
-
-  // if any of the arguments is poison, yield an arbitrary value, such that
-  // f(poison) -> f(42) works
-  vector<StateValue> ret;
-  auto T = out_types.begin();
-  auto var_name = name + "#pval";
-  for (auto &[v, np] : I->second.retvals) {
-    auto [val_poison, var] = mk_val(**T, var_name);
-    ret.emplace_back(expr::mkIf(all_args_np, v, val_poison), expr(np));
-    addQuantVar(move(var));
-    ++T;
-  }
-  return ret;
+  return I->second.retvals;
 }
 
 void State::addQuantVar(const expr &var) {
@@ -314,7 +321,6 @@ StateValue State::rewriteUndef(StateValue &&val, const set<expr> &undef_vars) {
 
 void State::finishInitializer() {
   is_initialization_phase = false;
-  memory.finishInitialization();
 }
 
 expr State::sinkDomain() const {
@@ -372,7 +378,7 @@ void State::syncSEdataWithSrc(const State &src) {
   }
 
   // The bid of tgt global starts with num_nonlocals_src
-  Memory::resetBids(num_nonlocals_src);
+  Memory::resetBids(num_nonlocals_src, false);
 }
 
 void State::mkAxioms(State &tgt) {
@@ -384,12 +390,13 @@ void State::mkAxioms(State &tgt) {
   // doesn't seem to be needed in practice for optimizations
   // since there's no introduction of calls in tgt
   for (auto &[fn, data] : fn_call_data) {
+    auto &data2 = tgt.fn_call_data.at(fn);
+
     for (auto I = data.begin(), E = data.end(); I != E; ++I) {
       auto &[ins, ptr_ins, mem, reads, argmem] = I->first;
       auto &[rets, ub, mem_state, used] = I->second;
       assert(used); (void)used;
 
-      auto &data2 = tgt.fn_call_data.at(fn);
       for (auto I2 = data2.begin(), E2 = data2.end(); I2 != E2; ++I2) {
         auto &[ins2, ptr_ins2, mem2, reads2, argmem2] = I2->first;
         auto &[rets2, ub2, mem_state2, used2] = I2->second;
@@ -397,46 +404,56 @@ void State::mkAxioms(State &tgt) {
         if (!used2 || reads != reads2 || argmem != argmem2)
           continue;
 
-        expr refines(true), is_val_eq(true);
+        expr refines(true);
         for (unsigned i = 0, e = ins.size(); i != e; ++i) {
-          expr eq_val = ins[i].value == ins2[i].value;
-          is_val_eq &= eq_val;
-          refines &= ins[i].non_poison.implies(eq_val && ins2[i].non_poison);
+          refines &= ins[i].non_poison.implies(ins[i].value == ins2[i].value &&
+                                               ins2[i].non_poison);
         }
 
-        if (is_val_eq.isFalse() && refines.isFalse())
+        if (refines.isFalse())
           continue;
 
+        set<expr> undef_vars;
         for (unsigned i = 0, e = ptr_ins.size(); i != e; ++i) {
           // TODO: needs to take read/read2 as input to control if mem blocks
           // need to be compared
-          auto &[ptr_in, is_byval] = ptr_ins[i];
-          auto &[ptr_in2, is_byval2] = ptr_ins2[i];
+          auto &[ptr_in, is_byval, is_nocapture] = ptr_ins[i];
+          auto &[ptr_in2, is_byval2, is_nocapture2] = ptr_ins2[i];
+          (void)is_nocapture;
+          (void)is_nocapture2;
           if (!is_byval && is_byval2) {
             // byval is added at target; this is not supported yet.
             refines = false;
             break;
           }
           expr eq_val = Pointer(mem, ptr_in.value)
-                      .fninputRefined(Pointer(mem2, ptr_in2.value), is_byval2);
-          is_val_eq &= eq_val;
+                          .fninputRefined(Pointer(mem2, ptr_in2.value),
+                                          undef_vars, is_byval2);
           refines &= ptr_in.non_poison
                        .implies(eq_val && ptr_in2.non_poison);
+
+          if (refines.isFalse())
+            break;
         }
+
+        if (refines.isFalse())
+          continue;
+
+        quantified_vars.insert(undef_vars.begin(), undef_vars.end());
 
         if (reads2) {
           auto restrict_ptrs = argmem2 ? &ptr_ins2 : nullptr;
-          expr mem_refined = mem.refined(mem2, true, restrict_ptrs).first;
-          is_val_eq &= mem_refined;
-          refines &= mem_refined;
+          auto data = mem.refined(mem2, true, restrict_ptrs);
+          refines &= get<0>(data);
+          quantified_vars.insert(get<2>(data).begin(), get<2>(data).end());
         }
 
-        expr ref_expr(true), eq_expr(true);
+        expr ref_expr(true);
         for (unsigned i = 0, e = rets.size(); i != e; ++i) {
-          eq_expr &= rets[i].value == rets2[i].value;
-          ref_expr &= rets[i].non_poison.implies(rets2[i].non_poison);
+          ref_expr &=
+            rets[i].non_poison.implies(rets2[i].non_poison &&
+                                       rets[i].value == rets2[i].value);
         }
-        tgt.addPre(is_val_eq.implies(eq_expr));
         tgt.addPre(refines.implies(ref_expr &&
                                    ub.implies(ub2) &&
                                    mem_state.implies(mem_state2)));

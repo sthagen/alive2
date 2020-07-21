@@ -56,7 +56,7 @@ private:
   smt::AndExpr axioms;
   smt::AndExpr ooms;
 
-  const BasicBlock *current_bb;
+  const BasicBlock *current_bb = nullptr;
   std::set<smt::expr> quantified_vars;
 
   // var -> ((value, not_poison), undef_vars, already_used?)
@@ -78,21 +78,23 @@ private:
   CurrentDomain domain;
   Memory memory;
   std::set<smt::expr> undef_vars;
-  std::array<StateValue, 32> tmp_values;
+  std::array<StateValue, 64> tmp_values;
   unsigned i_tmp_values = 0; // next available position in tmp_values
 
   // return_domain: a boolean expression describing return condition
   smt::OrExpr return_domain;
+  // function_domain: a condition for function having well-defined behavior
+  smt::OrExpr function_domain;
   smt::DisjointExpr<StateValue> return_val;
   smt::DisjointExpr<Memory> return_memory;
   std::set<smt::expr> return_undef_vars;
 
   struct FnCallInput {
     std::vector<StateValue> args_nonptr;
-    // (ptr arguments, is by_val arg?)
-    std::vector<std::pair<StateValue, bool>> args_ptr;
+    std::vector<Memory::PtrInput> args_ptr;
     Memory m;
     bool readsmem, argmemonly;
+
     bool operator<(const FnCallInput &rhs) const {
       return std::tie(args_nonptr, args_ptr, m, readsmem, argmemonly) <
              std::tie(rhs.args_nonptr, rhs.args_ptr, rhs.m, rhs.readsmem,
@@ -128,19 +130,20 @@ public:
                    const BasicBlock &dst_false);
   void addReturn(const StateValue &val);
 
+  void addAxiom(smt::AndExpr &&ands) { axioms.add(std::move(ands)); }
   void addAxiom(smt::expr &&axiom) { axioms.add(std::move(axiom)); }
   void addPre(smt::expr &&cond, bool forApprox = false)
   { (forApprox ? preconditionForApprox : precondition).add(std::move(cond)); }
   void addUB(smt::expr &&ub);
   void addUB(const smt::expr &ub);
   void addUB(smt::AndExpr &&ubs);
+  void addNoReturn();
   void addOOM(smt::expr &&oom) { ooms.add(std::move(oom)); }
 
-  const std::vector<StateValue>
+  std::vector<StateValue>
     addFnCall(const std::string &name, std::vector<StateValue> &&inputs,
-              std::vector<std::pair<StateValue, bool>> &&ptr_inputs,
-              const std::vector<Type*> &out_types, bool reads_memory,
-              bool writes_memory, bool argmemonly);
+              std::vector<Memory::PtrInput> &&ptr_inputs,
+              const std::vector<Type*> &out_types, const FnAttrs &attrs);
 
   void addQuantVar(const smt::expr &var);
   void addUndefVar(smt::expr &&var);
@@ -163,6 +166,7 @@ public:
   const auto& getValues() const { return values; }
   const auto& getQuantVars() const { return quantified_vars; }
 
+  auto& functionDomain() const { return function_domain; }
   auto& returnDomain() const { return return_domain; }
   smt::expr sinkDomain() const;
   Memory returnMemory() const { return *return_memory(); }
@@ -186,6 +190,10 @@ public:
 
   void mkAxioms(State &tgt);
   smt::expr simplifyWithAxioms(smt::expr &&e) const;
+
+  struct cleanup_state {
+    ~cleanup_state() { Memory::resetState(); }
+  };
 
 private:
   void addJump(const BasicBlock &dst, smt::expr &&domain);

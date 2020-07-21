@@ -228,6 +228,8 @@ space+ {
 "uge" { return UGE; }
 "ugt" { return UGT; }
 "call" { return CALL; }
+"noread" { return NOREAD; }
+"nowrite" { return NOWRITE; }
 "freeze" { return FREEZE; }
 "malloc" { return MALLOC; }
 "free" { return FREE; }
@@ -253,6 +255,15 @@ space+ {
 "usub_overflow" { return USUB_OVERFLOW; }
 "smul_overflow" { return SMUL_OVERFLOW; }
 "umul_overflow" { return UMUL_OVERFLOW; }
+"reduce_add" { return REDUCE_ADD; }
+"reduce_mul" { return REDUCE_MUL; }
+"reduce_and" { return REDUCE_AND; }
+"reduce_or" { return REDUCE_OR; }
+"reduce_xor" { return REDUCE_XOR; }
+"reduce_smax" { return REDUCE_SMAX; }
+"reduce_smin" { return REDUCE_SMIN; }
+"reduce_umax" { return REDUCE_UMAX; }
+"reduce_umin" { return REDUCE_UMIN; }
 "fadd" { return FADD; }
 "fsub" { return FSUB; }
 "fmul" { return FMUL; }
@@ -283,6 +294,8 @@ space+ {
 "nnan" { return NNAN; }
 "ninf" { return NINF; }
 "nsz" { return NSZ; }
+"assume" { return ASSUME; }
+"assume_non_poison" { return ASSUME_NON_POISON; }
 "unreachable" { return UNREACH; }
 
 [a-zA-Z][a-zA-Z0-9]* {

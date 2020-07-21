@@ -3,6 +3,7 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
+#include "ir/attrs.h"
 #include "ir/instr.h"
 #include "ir/precondition.h"
 #include "ir/value.h"
@@ -36,6 +37,7 @@ public:
   void fixupTypes(const smt::Model &m);
 
   void addInstr(std::unique_ptr<Instr> &&i);
+  void delInstr(Instr *i);
 
   util::const_strip_unique_ptr<decltype(m_instrs)> instrs() const {
     return m_instrs;
@@ -67,6 +69,8 @@ class Function final {
   std::vector<std::unique_ptr<AggregateValue>> aggregates;
   std::vector<std::unique_ptr<Value>> inputs;
 
+  FnAttrs attrs;
+
 public:
   Function() {}
   Function(Type &type, std::string &&name, unsigned bits_pointers = 64,
@@ -79,10 +83,13 @@ public:
 
   const std::string& getName() const { return name; }
 
+  auto& getFnAttrs() { return attrs; }
+
   smt::expr getTypeConstraints() const;
   void fixupTypes(const smt::Model &m);
 
   const BasicBlock& getFirstBB() const { return *BB_order[0]; }
+  BasicBlock& getFirstBB() { return *BB_order[0]; }
   BasicBlock& getBB(std::string_view name, bool push_front = false);
   const BasicBlock& getBB(std::string_view name) const;
   const BasicBlock* getBBIfExists(std::string_view name) const;
@@ -145,6 +152,10 @@ public:
   instr_helper instrs() { return *this; }
   instr_helper instrs() const { return *this; }
 
+  std::multimap<Value*, Value*> getUsers() const;
+  bool removeUnusedStuff(const std::multimap<Value*, Value*> &users,
+                         const std::vector<std::string_view> &src_glbs);
+
   void print(std::ostream &os, bool print_header = true) const;
   friend std::ostream &operator<<(std::ostream &os, const Function &f);
 };
@@ -193,7 +204,7 @@ class DomTree final {
     std::unordered_map<const BasicBlock*, DomTreeNode> doms;
 
     void buildDominators();
-    static DomTreeNode* intersect(DomTreeNode *b1, DomTreeNode *b2);
+    DomTreeNode* intersect(DomTreeNode *b1, DomTreeNode *b2);
 
   public:
     DomTree(Function &f, CFG &cfg) : f(f), cfg(cfg) { buildDominators(); }

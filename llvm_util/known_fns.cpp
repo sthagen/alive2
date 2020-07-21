@@ -5,6 +5,7 @@
 #include "llvm_util/utils.h"
 #include "ir/function.h"
 #include "ir/instr.h"
+#include "util/config.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -15,6 +16,7 @@ using namespace std;
 
 #define RETURN_KNOWN(op)    return { op, true }
 #define RETURN_FAIL_KNOWN() return { nullptr, true }
+#define RETURN_FAIL_UNKNOWN() return { nullptr, false }
 
 namespace llvm_util {
 
@@ -23,7 +25,7 @@ known_call(llvm::CallInst &i, const llvm::TargetLibraryInfo &TLI,
            BasicBlock &BB, const vector<Value*> &args) {
   auto ty = llvm_type2alive(i.getType());
   if (!ty)
-    RETURN_FAIL_KNOWN();
+    RETURN_FAIL_UNKNOWN();
 
   // TODO: add support for checking mismatch of C vs C++ alloc fns
   if (llvm::isMallocLikeFn(&i, &TLI, false)) {
@@ -40,7 +42,33 @@ known_call(llvm::CallInst &i, const llvm::TargetLibraryInfo &TLI,
   auto decl = i.getCalledFunction();
   llvm::LibFunc libfn;
   if (!decl || !TLI.getLibFunc(*decl, libfn) || !TLI.has(libfn))
-    return { nullptr, false };
+    RETURN_FAIL_UNKNOWN();
+
+  if (util::config::io_nobuiltin) {
+    switch (libfn) {
+    case llvm::LibFunc_printf:
+    case llvm::LibFunc_putc:
+    case llvm::LibFunc_putchar:
+    case llvm::LibFunc_puts:
+    case llvm::LibFunc_scanf:
+    case llvm::LibFunc_fclose:
+    case llvm::LibFunc_ferror:
+    case llvm::LibFunc_fgetc:
+    case llvm::LibFunc_fprintf:
+    case llvm::LibFunc_fputc:
+    case llvm::LibFunc_fputs:
+    case llvm::LibFunc_fread:
+    case llvm::LibFunc_fscanf:
+    case llvm::LibFunc_fwrite:
+    case llvm::LibFunc_lstat:
+    case llvm::LibFunc_perror:
+    case llvm::LibFunc_read:
+    case llvm::LibFunc_write:
+      RETURN_FAIL_UNKNOWN();
+    default:
+      break;
+    }
+  }
 
   switch (libfn) {
   case llvm::LibFunc_memset: // void* memset(void *ptr, int val, size_t bytes)
@@ -60,6 +88,12 @@ known_call(llvm::CallInst &i, const llvm::TargetLibraryInfo &TLI,
       }
     }
     RETURN_KNOWN(make_unique<Strlen>(*ty, value_name(i), *args[0]));
+  case llvm::LibFunc_memcmp:
+  case llvm::LibFunc_bcmp: {
+    RETURN_KNOWN(
+      make_unique<Memcmp>(*ty, value_name(i), *args[0], *args[1], *args[2],
+                          libfn == llvm::LibFunc_bcmp));
+  }
   default:
     RETURN_FAIL_KNOWN();
   }

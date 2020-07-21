@@ -7,11 +7,16 @@ namespace smt { class expr; }
 
 namespace IR {
 
-/// Upperbound of the number of non-local pointers returned by instructions
-extern unsigned num_max_nonlocals_inst;
+/// Upperbound of the number of local blocks
+extern unsigned num_locals_src, num_locals_tgt;
 
-/// Upperbound of the number of local blocks (max(src, tgt))
-extern unsigned num_locals;
+/// Number of constant global variables in src
+extern unsigned num_consts_src;
+
+extern unsigned num_globals_src;
+
+/// Number of non-constant globals introduced in tgt
+extern unsigned num_extra_nonconst_tgt;
 
 // Upperbound of the number of nonlocal blocks
 extern unsigned num_nonlocals;
@@ -38,6 +43,7 @@ extern unsigned bits_size_t;
 extern unsigned bits_byte;
 
 extern unsigned strlen_unroll_cnt;
+extern unsigned memcmp_unroll_cnt;
 
 extern bool little_endian;
 
@@ -48,6 +54,8 @@ extern bool has_ptr2int;
 /// Whether malloc or free/delete is used in either function
 extern bool has_malloc;
 extern bool has_free;
+/// Whether there is an alloca
+extern bool has_alloca;
 
 extern bool has_fncall;
 

@@ -7,6 +7,7 @@
 #include "smt/expr.h"
 #include "util/compiler.h"
 #include "util/config.h"
+#include <sstream>
 
 using namespace smt;
 using namespace std;
@@ -156,24 +157,15 @@ void AggregateValue::print(std::ostream &os) const {
 }
 
 
-static string attr_str(unsigned attributes) {
-  string ret;
-  if (attributes & Input::NonNull)
-    ret += "nonnull ";
-  if (attributes & Input::ByVal)
-    ret += "byval ";
-  if (attributes & Input::NoCapture)
-    ret += "nocapture ";
-  if (attributes & Input::ReadOnly)
-    ret += "readonly ";
-  if (attributes & Input::ReadNone)
-    ret += "readnone ";
-  return ret;
+static string attr_str(const ParamAttrs &attr) {
+  stringstream ss;
+  ss << attr;
+  return ss.str();
 }
 
-Input::Input(Type &type, string &&name, unsigned attributes)
+Input::Input(Type &type, string &&name, ParamAttrs &&attributes)
   : Value(type, attr_str(attributes) + name), smt_name(move(name)),
-    attributes(attributes) {}
+    attrs(move(attributes)) {}
 
 void Input::copySMTName(const Input &other) {
   smt_name = other.smt_name;
@@ -188,29 +180,43 @@ StateValue Input::toSMT(State &s) const {
   expr type = getTyVar();
 
   expr val;
-  if (attributes & ByVal) {
+  if (hasAttribute(ParamAttrs::ByVal)) {
     unsigned bid;
     string sz_name = getName() + "#size";
     expr size = expr::mkVar(sz_name.c_str(), bits_size_t-1).zext(1);
     val = get_global(s, getName(), size, 1, false, bid);
     s.getMemory().markByVal(bid);
   } else {
-    val = getType().mkInput(s, smt_name.c_str(), attributes);
+    val = getType().mkInput(s, smt_name.c_str(), attrs);
   }
 
-  if (!config::disable_undef_input) {
-    auto [undef, vars] = getType().mkUndefInput(s, attributes);
+  bool has_deref = hasAttribute(ParamAttrs::Dereferenceable);
+  bool has_nonnull = hasAttribute(ParamAttrs::NonNull);
+
+  if (!config::disable_undef_input && !has_deref) {
+    auto [undef, vars] = getType().mkUndefInput(s, attrs);
     for (auto &v : vars) {
       s.addUndefVar(move(v));
     }
     val = expr::mkIf(type.extract(0, 0) == 0, val, undef);
   }
 
+  if (has_deref || has_nonnull) {
+    Pointer p(s.getMemory(), val);
+    if (has_deref) {
+      s.addAxiom(type == 0);
+      s.addAxiom(p.isDereferenceable(attrs.getDerefBytes(), bits_byte/8, false));
+    }
+    if (has_nonnull && !has_deref) {
+      s.addAxiom(type.extract(1, 1) == 0);
+    }
+  }
+
   expr poison = getType().getDummyValue(false).non_poison;
   expr non_poison = getType().getDummyValue(true).non_poison;
 
   return { move(val),
-           config::disable_poison_input
+           config::disable_poison_input || has_deref
              ? move(non_poison)
              : expr::mkIf(type.extract(1, 1) == 0, non_poison, poison) };
 }

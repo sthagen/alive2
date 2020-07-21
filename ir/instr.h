@@ -71,7 +71,9 @@ public:
 
 class UnaryOp final : public Instr {
 public:
-  enum Op { Copy, BitReverse, BSwap, Ctpop, IsConstant, FNeg };
+  enum Op {
+    Copy, BitReverse, BSwap, Ctpop, IsConstant, FNeg
+  };
 
 private:
   Value *val;
@@ -82,6 +84,32 @@ public:
   UnaryOp(Type &type, std::string &&name, Value &val, Op op,
           FastMathFlags fmath = {})
     : Instr(type, std::move(name)), val(&val), op(op), fmath(fmath) {}
+
+  Op getOp() const { return op; }
+  Value& getValue() const { return *val; }
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
+class UnaryReductionOp final : public Instr {
+public:
+  enum Op {
+    Add, Mul, And, Or, Xor,
+    SMax, SMin, UMax, UMin
+  };
+
+private:
+  Value *val;
+  Op op;
+
+public:
+  UnaryReductionOp(Type &type, std::string &&name, Value &val, Op op)
+    : Instr(type, std::move(name)), val(&val), op(op) {}
 
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
@@ -144,6 +172,9 @@ public:
   Select(Type &type, std::string &&name, Value &cond, Value &a, Value &b)
     : Instr(type, std::move(name)), cond(&cond), a(&a), b(&b) {}
 
+  Value *getTrueValue() const { return a; }
+  Value *getFalseValue() const { return b; }
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -188,24 +219,22 @@ public:
 
 
 class FnCall final : public Instr {
-public:
-  enum Flags { None = 0, NoRead = 1 << 0, NoWrite = 1 << 1, ArgMemOnly = 1 << 2,
-               NNaN = 1 << 3 };
-  enum ArgFlags { ArgNone = 0, ArgByVal = 1 << 0 };
 private:
   std::string fnName;
-  std::vector<std::pair<Value*, unsigned>> args;
-  unsigned flags;
+  std::vector<std::pair<Value*, ParamAttrs>> args;
+  FnAttrs attrs;
   bool valid;
 public:
   FnCall(Type &type, std::string &&name, std::string &&fnName,
-         unsigned flags = None, bool valid = true)
-    : Instr(type, std::move(name)), fnName(std::move(fnName)), flags(flags),
-      valid(valid) {}
-  void addArg(Value &arg, unsigned flags);
+         FnAttrs &&attrs = FnAttrs::None, bool valid = true)
+    : Instr(type, std::move(name)), fnName(std::move(fnName)),
+      attrs(std::move(attrs)), valid(valid) {}
+  void addArg(Value &arg, ParamAttrs &&attrs);
   const auto& getFnName() const { return fnName; }
   const auto& getArgs() const { return args; }
+  const auto& getAttributes() const { return attrs; }
 
+  bool hasAttribute(const FnAttrs::Attribute &i) const { return attrs.has(i); }
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -397,19 +426,71 @@ public:
 };
 
 
-class Alloc final : public Instr {
+class MemInstr : public Instr {
+public:
+  MemInstr(Type &type, std::string &&name) : Instr(type, move(name)) {}
+
+  // If this instruction allocates a memory block, return its size.
+  // Return 0 if it doesn't allocate anything.
+  virtual uint64_t getMaxAllocSize() const = 0;
+
+  // If this instruction performs load or store, return its max access size.
+  virtual uint64_t getMaxAccessSize() const = 0;
+
+  // If this instruction performs pointer arithmetic, return the absolute
+  // value of the adding offset.
+  // If this instruction is accessing the memory, it is okay to return 0.
+  // ex) Given `store i32 0, ptr`, 0 can be returned, because its access size
+  // already contains the offset.
+  virtual uint64_t getMaxGEPOffset() const = 0;
+
+  struct ByteAccessInfo {
+    // Does this instruction use integer (pointer) value of a byte?
+    // If it stores poison value (e.g. uninitialized bytes of alloca), it is
+    // okay for both variables to be false.
+    bool hasIntByteAccess = false;
+    bool hasPtrByteAccess = false;
+    // Does this intruction load / store pointers?
+    // If hasPtrByteAccess is false, these cannot be true.
+    bool doesPtrLoad = false;
+    bool doesPtrStore = false;
+    // The maximum size of a byte that this instruction can support.
+    // If zero, this instruction does not read/write bytes.
+    // Otherwise, bytes of a memory can be widened to this size.
+    unsigned byteSize = 0;
+    // Does this instruction have sub-byte access (less than 8 bits)?
+    bool hasSubByteAccess = false;
+
+    bool doesMemAccess() const { return byteSize; }
+
+    static ByteAccessInfo intOnly(unsigned byteSize);
+    static ByteAccessInfo get(const Type &t, bool store, unsigned align);
+    static ByteAccessInfo full(unsigned byteSize, bool subByte = false);
+  };
+
+  virtual ByteAccessInfo getByteAccessInfo() const = 0;
+};
+
+ 
+class Alloc final : public MemInstr {
   Value *size, *mul;
   unsigned align;
   bool initially_dead;
 public:
   Alloc(Type &type, std::string &&name, Value &size, Value *mul, unsigned align,
         bool initially_dead)
-    : Instr(type, std::move(name)), size(&size), mul(mul), align(align),
+    : MemInstr(type, std::move(name)), size(&size), mul(mul), align(align),
       initially_dead(initially_dead) {}
 
   Value& getSize() const { return *size; }
   Value* getMul() const { return mul; }
   bool initDead() const { return initially_dead; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -419,7 +500,7 @@ public:
 };
 
 
-class Malloc final : public Instr {
+class Malloc final : public MemInstr {
   Value *ptr = nullptr, *size;
   // Is this malloc (or equivalent operation, like new()) never returning
   // null?
@@ -427,13 +508,19 @@ class Malloc final : public Instr {
 
 public:
   Malloc(Type &type, std::string &&name, Value &size, bool isNonNull)
-    : Instr(type, std::move(name)), size(&size), isNonNull(isNonNull) {}
+    : MemInstr(type, std::move(name)), size(&size), isNonNull(isNonNull) {}
 
   Malloc(Type &type, std::string &&name, Value &ptr, Value &size)
-    : Instr(type, std::move(name)), ptr(&ptr), size(&size) {}
+    : MemInstr(type, std::move(name)), ptr(&ptr), size(&size) {}
 
   Value& getSize() const { return *size; }
   bool isRealloc() const { return ptr != nullptr; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -443,14 +530,20 @@ public:
 };
 
 
-class Calloc final : public Instr {
+class Calloc final : public MemInstr {
   Value *num, *size;
 public:
   Calloc(Type &type, std::string &&name, Value &num, Value &size)
-    : Instr(type, std::move(name)), num(&num), size(&size) {}
+    : MemInstr(type, std::move(name)), num(&num), size(&size) {}
 
   Value& getNum() const { return *num; }
   Value& getSize() const { return *size; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -460,11 +553,16 @@ public:
 };
 
 
-class StartLifetime final : public Instr {
+class StartLifetime final : public MemInstr {
   Value *ptr;
 public:
-  StartLifetime(Value &ptr) : Instr(Type::voidTy, "start_lifetime"),
+  StartLifetime(Value &ptr) : MemInstr(Type::voidTy, "start_lifetime"),
       ptr(&ptr) {}
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
@@ -475,12 +573,17 @@ public:
 };
 
 
-class Free final : public Instr {
+class Free final : public MemInstr {
   Value *ptr;
   bool heaponly;
 public:
-  Free(Value &ptr, bool heaponly = true) : Instr(Type::voidTy, "free"),
+  Free(Value &ptr, bool heaponly = true) : MemInstr(Type::voidTy, "free"),
       ptr(&ptr), heaponly(heaponly) {}
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
@@ -491,18 +594,23 @@ public:
 };
 
 
-class GEP final : public Instr {
+class GEP final : public MemInstr {
   Value *ptr;
   std::vector<std::pair<unsigned, Value*>> idxs;
   bool inbounds;
 public:
   GEP(Type &type, std::string &&name, Value &ptr, bool inbounds)
-    : Instr(type, std::move(name)), ptr(&ptr), inbounds(inbounds) {}
+    : MemInstr(type, std::move(name)), ptr(&ptr), inbounds(inbounds) {}
 
   void addIdx(unsigned obj_size, Value &idx);
   Value& getPtr() const { return *ptr; }
   auto& getIdxs() const { return idxs; }
 
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -512,16 +620,22 @@ public:
 };
 
 
-class Load final : public Instr {
+class Load final : public MemInstr {
   Value *ptr;
   unsigned align;
 public:
   Load(Type &type, std::string &&name, Value &ptr, unsigned align)
-    : Instr(type, std::move(name)), ptr(&ptr), align(align) {}
+    : MemInstr(type, std::move(name)), ptr(&ptr), align(align) {}
 
   Value& getPtr() const { return *ptr; }
-  std::vector<Value*> operands() const override;
   unsigned getAlign() const { return align; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
+  std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -530,17 +644,24 @@ public:
 };
 
 
-class Store final : public Instr {
+class Store final : public MemInstr {
   Value *ptr, *val;
   unsigned align;
 public:
   Store(Value &ptr, Value &val, unsigned align)
-    : Instr(Type::voidTy, "store"), ptr(&ptr), val(&val), align(align) {}
+    : MemInstr(Type::voidTy, "store"), ptr(&ptr), val(&val), align(align) {}
 
-  std::vector<Value*> operands() const override;
   Value& getValue() const { return *val; }
   Value& getPtr() const { return *ptr; }
   unsigned getAlign() const { return align; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxAccessStride() const;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
+  std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -549,16 +670,22 @@ public:
 };
 
 
-class Memset final : public Instr {
+class Memset final : public MemInstr {
   Value *ptr, *val, *bytes;
   unsigned align;
 public:
   Memset(Value &ptr, Value &val, Value &bytes, unsigned align)
-    : Instr(Type::voidTy, "memset"), ptr(&ptr), val(&val), bytes(&bytes),
+    : MemInstr(Type::voidTy, "memset"), ptr(&ptr), val(&val), bytes(&bytes),
             align(align) {}
 
   Value& getBytes() const { return *bytes; }
   unsigned getAlign() const { return align; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -568,19 +695,25 @@ public:
 };
 
 
-class Memcpy final : public Instr {
+class Memcpy final : public MemInstr {
   Value *dst, *src, *bytes;
   unsigned align_dst, align_src;
   bool move;
 public:
   Memcpy(Value &dst, Value &src, Value &bytes,
          unsigned align_dst, unsigned align_src, bool move)
-    : Instr(Type::voidTy, "memcpy"), dst(&dst), src(&src), bytes(&bytes),
+    : MemInstr(Type::voidTy, "memcpy"), dst(&dst), src(&src), bytes(&bytes),
             align_dst(align_dst), align_src(align_src), move(move) {}
 
   Value& getBytes() const { return *bytes; }
   unsigned getSrcAlign() const { return align_src; }
   unsigned getDstAlign() const { return align_dst; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -590,13 +723,43 @@ public:
 };
 
 
-class Strlen final : public Instr {
+class Memcmp final : public MemInstr {
+  Value *ptr1, *ptr2, *num;
+  bool is_bcmp;
+public:
+  Memcmp(Type &type, std::string &&name, Value &ptr1, Value &ptr2, Value &num,
+         bool is_bcmp): MemInstr(type, std::move(name)), ptr1(&ptr1),
+                        ptr2(&ptr2), num(&num), is_bcmp(is_bcmp) {}
+
+  Value &getBytes() const { return *num; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
+class Strlen final : public MemInstr {
   Value *ptr;
 public:
   Strlen(Type &type, std::string &&name, Value &ptr)
-    : Instr(type, std::move(name)), ptr(&ptr) {}
+    : MemInstr(type, std::move(name)), ptr(&ptr) {}
 
   Value *getPointer() const { return ptr; }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -649,4 +812,8 @@ public:
   std::unique_ptr<Instr> dup(const std::string &suffix) const override;
 };
 
+
+const ConversionOp *isCast(ConversionOp::Op op, const Value &v);
+bool hasNoSideEffects(const Instr &i);
+Value *isNoOp(const Value &v);
 }
