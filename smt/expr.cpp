@@ -9,7 +9,6 @@
 #include <limits>
 #include <memory>
 #include <string>
-#include <unordered_set>
 #include <z3.h>
 
 #define DEBUG_Z3_RC 0
@@ -161,6 +160,11 @@ expr expr::mkUInt(uint64_t n, Z3_sort sort) {
 
 expr expr::mkUInt(uint64_t n, unsigned bits) {
   return bits ? mkUInt(n, mkBVSort(bits)) : expr();
+}
+
+expr expr::mkUInt(uint64_t n, const expr &type) {
+  C2(type);
+  return mkUInt(n, type.sort());
 }
 
 expr expr::mkInt(int64_t n, Z3_sort sort) {
@@ -332,9 +336,10 @@ bool expr::isSMax() const {
   return eq(IntSMax(bits()));
 }
 
-bool expr::isSigned() const {
+expr expr::isNegative() const {
+  C();
   auto bit = bits() - 1;
-  return extract(bit, bit).isOne();
+  return extract(bit, bit) == 1;
 }
 
 unsigned expr::bits() const {
@@ -647,6 +652,17 @@ expr expr::usub_sat(const expr &rhs) const {
               *this - rhs);
 }
 
+expr expr::sshl_sat(const expr &rhs) const {
+  C();
+  return mkIf(shl_no_soverflow(rhs), *this << rhs,
+              mkIf(isNegative(), IntSMin(bits()), IntSMax(bits())));
+}
+
+expr expr::ushl_sat(const expr &rhs) const {
+  C();
+  return mkIf(shl_no_uoverflow(rhs), *this << rhs, IntUMax(bits()));
+}
+
 expr expr::add_no_soverflow(const expr &rhs) const {
   if (min_leading_zeros() >= 2 && rhs.min_leading_zeros() >= 2)
     return true;
@@ -856,6 +872,12 @@ expr expr::smin(const expr &rhs) const {
 
 expr expr::smax(const expr &rhs) const {
   return mkIf(sge(rhs), *this, rhs);
+}
+
+expr expr::abs() const {
+  C();
+  auto s = sort();
+  return mkIf(sge(mkUInt(0, s)), *this, mkInt(-1, s) * *this);
 }
 
 expr expr::isNaN() const {
@@ -1614,6 +1636,14 @@ expr expr::mkForAll(const set<expr> &vars, expr &&val) {
 
 expr expr::mkLambda(const expr &var, const expr &val) {
   C2(var, val);
+
+  if (!val.vars().count(var))
+    return mkConstArray(var, val);
+
+  expr array, idx;
+  if (val.isLoad(array, idx) && idx.eq(var))
+    return array;
+
   auto ast = (Z3_app)var();
   return Z3_mk_lambda_const(ctx(), 1, &ast, val());
 }
@@ -1706,33 +1736,12 @@ set<expr> expr::vars(const vector<const expr*> &exprs) {
   return result;
 }
 
-vector<expr> expr::allLeafs(const expr &e) {
-  vector<expr> ret;
-  vector<expr> worklist = { e };
-  unordered_set<Z3_ast> seen;
-  do {
-    expr v = worklist.back();
-    worklist.pop_back();
-    if (!seen.insert(v.isValid() ? v() : nullptr).second)
-      continue;
-
-    expr cond, then, els;
-    if (v.isIf(cond, then, els)) {
-      worklist.emplace_back(move(then));
-      worklist.emplace_back(move(els));
-    } else {
-      ret.emplace_back(move(v));
-    }
-  } while (!worklist.empty());
-  return ret;
-}
-
 void expr::printUnsigned(ostream &os) const {
   os << numeral_string();
 }
 
 void expr::printSigned(ostream &os) const {
-  if (isSigned()) {
+  if (isNegative().isTrue()) {
     os << '-';
     (~*this + mkUInt(1, sort())).printUnsigned(os);
   } else {
@@ -1776,6 +1785,31 @@ unsigned expr::id() const {
 
 unsigned expr::hash() const {
   return Z3_get_ast_hash(ctx(), ast());
+}
+
+
+ExprLeafIterator::ExprLeafIterator(const expr &init)
+  : worklist({init}), end(false) {
+  ++*this;
+}
+
+void ExprLeafIterator::operator++(void) {
+  assert(!end);
+  while (!worklist.empty()) {
+    val = move(worklist.back());
+    worklist.pop_back();
+    if (!val.isValid() || !seen.insert(val()).second)
+      continue;
+
+    expr cond, then, els;
+    if (val.isIf(cond, then, els)) {
+      worklist.emplace_back(move(then));
+      worklist.emplace_back(move(els));
+    } else {
+      return;
+    }
+  }
+  end = true;
 }
 
 }

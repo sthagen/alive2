@@ -25,7 +25,7 @@ VoidType Type::voidTy;
 
 unsigned Type::np_bits() const {
   auto bw = bits();
-  return does_sub_byte_access ? bw : (unsigned)divide_up(bw, bits_byte);
+  return min(bw, (unsigned)divide_up(bw * bits_poison_per_byte, bits_byte));
 }
 
 expr Type::var(const char *var, unsigned bits) const {
@@ -358,7 +358,7 @@ void IntType::printVal(ostream &os, State &s, const expr &e) const {
   e.printHexadecimal(os);
   os << " (";
   e.printUnsigned(os);
-  if (e.bits() > 1 && e.isSigned()) {
+  if (e.bits() > 1 && e.isNegative().isTrue()) {
     os << ", ";
     e.printSigned(os);
   }
@@ -810,9 +810,11 @@ StateValue AggregateType::getDummyValue(bool non_poison) const {
 
   vector<StateValue> vals;
   for (unsigned i = 0; i < elements; ++i) {
+    if (isPadding(i))
+      continue;
     vals.emplace_back(children[i]->getDummyValue(non_poison));
   }
-  return aggregateVals(vals);
+  return aggregateVals(vals, true);
 }
 
 expr AggregateType::getTypeConstraints() const {
@@ -1062,6 +1064,12 @@ StateValue VectorType::update(const StateValue &vector,
 
   return fromBV({ (vector.value & mask_v) | nv_shifted,
                   (vector.non_poison & mask_np) | np_shifted});
+}
+
+unsigned VectorType::np_bits() const {
+  if (getChild(0).isPtrType())
+    return elements;
+  return Type::np_bits();
 }
 
 expr VectorType::getTypeConstraints() const {
@@ -1407,23 +1415,33 @@ bool isNonPtrVector(const Type &t) {
   return vty && !vty->getChild(0).isPtrType();
 }
 
-bool hasSubByte(const Type &t) {
+unsigned minVectorElemSize(const Type &t) {
   if (auto agg = t.getAsAggregateType()) {
     if (t.isVectorType()) {
       auto &elemTy = agg->getChild(0);
-      return elemTy.isPtrType() ? false : (elemTy.bits() % 8);
+      return elemTy.isPtrType() ? IR::bits_program_pointer : elemTy.bits();
     }
 
+    unsigned val = 0;
     for (unsigned i = 0, e = agg->numElementsConst(); i != e;  ++i) {
-      if (hasSubByte(agg->getChild(i)))
-        return true;
+      if (auto ch = minVectorElemSize(agg->getChild(i))) {
+        val = val ? gcd(val, ch) : ch;
+      }
     }
+    return val;
   }
-  return false;
+  return 0;
 }
 
 uint64_t getCommonAccessSize(const IR::Type &ty) {
   if (auto agg = ty.getAsAggregateType()) {
+    // non-pointer vectors are stored/loaded all at once
+    if (agg->isVectorType()) {
+      auto &elemTy = agg->getChild(0);
+      if (!elemTy.isPtrType())
+        return divide_up(agg->numElementsConst() * elemTy.bits(), 8);
+    }
+
     uint64_t sz = 1;
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
       auto n = getCommonAccessSize(agg->getChild(i));

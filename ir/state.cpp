@@ -38,7 +38,7 @@ State::State(Function &f, bool source)
     return_val(f.getType().getDummyValue(false)), return_memory(memory) {}
 
 void State::resetGlobals() {
-  Memory::resetBids(has_null_block, true);
+  Memory::resetGlobals();
 }
 
 const StateValue& State::exec(const Value &v) {
@@ -179,8 +179,8 @@ void State::addCondJump(const expr &cond, const BasicBlock &dst_true,
   addUB(expr(false));
 }
 
-void State::addReturn(const StateValue &val) {
-  return_val.add(val, domain.path);
+void State::addReturn(StateValue &&val) {
+  return_val.add(move(val), domain.path);
   return_memory.add(memory, domain.path);
   return_domain.add(domain());
   function_domain.add(domain());
@@ -211,6 +211,7 @@ void State::addUB(AndExpr &&ubs) {
 }
 
 void State::addNoReturn() {
+  return_memory.add(memory, domain.path);
   function_domain.add(domain());
   return_undef_vars.insert(undef_vars.begin(), undef_vars.end());
   return_undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
@@ -222,20 +223,17 @@ vector<StateValue>
 State::addFnCall(const string &name, vector<StateValue> &&inputs,
                  vector<Memory::PtrInput> &&ptr_inputs,
                  const vector<Type*> &out_types, const FnAttrs &attrs) {
-  // TODO: handle changes to memory due to fn call
   // TODO: can read/write=false fn calls be removed?
 
   bool reads_memory = !attrs.has(FnAttrs::NoRead);
   bool writes_memory = !attrs.has(FnAttrs::NoWrite);
   bool argmemonly = attrs.has(FnAttrs::ArgMemOnly);
+  bool noundef = attrs.has(FnAttrs::NoUndef);
 
-  bool all_valid = true;
-  for (auto &v : inputs) {
-    all_valid &= v.isValid();
-  }
-  for (auto &v : ptr_inputs) {
-    all_valid &= v.val.isValid();
-  }
+  bool all_valid = std::all_of(inputs.begin(), inputs.end(),
+                                [](auto &v) { return v.isValid(); }) &&
+                   std::all_of(ptr_inputs.begin(), ptr_inputs.end(),
+                                [](auto &v) { return v.val.isValid(); });
 
   if (!all_valid) {
     addUB(expr());
@@ -243,7 +241,7 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
   }
 
   for (auto &v : ptr_inputs) {
-    if (!v.nocapture && !v.val.non_poison.isFalse())
+    if (!v.byval && !v.nocapture && !v.val.non_poison.isFalse())
       memory.escapeLocalPtr(v.val.value);
   }
 
@@ -254,21 +252,20 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
   auto &I = call_data_pair.first;
   bool inserted = call_data_pair.second;
 
-  auto mk_val = [&](const Type &t, const string &name) {
-    if (t.isPtrType())
-      return memory.mkFnRet(name.c_str(), I->first.args_ptr);
-
-    auto v = expr::mkFreshVar(name.c_str(), t.getDummyValue(false).value);
-    return make_pair(v, v);
-  };
-
   if (inserted) {
+    auto mk_val = [&](const Type &t, const string &name) {
+      if (t.isPtrType())
+        return memory.mkFnRet(name.c_str(), I->first.args_ptr).first;
+
+      return expr::mkFreshVar(name.c_str(), t.getDummyValue(false).value);
+    };
+
     vector<StateValue> values;
     string valname = name + "#val";
     string npname = name + "#np";
     for (auto t : out_types) {
-      values.emplace_back(mk_val(*t, valname).first,
-                          expr::mkFreshVar(npname.c_str(), false));
+      expr np = noundef ? expr(true) : expr::mkFreshVar(npname.c_str(), false);
+      values.emplace_back(mk_val(*t, valname), move(np));
     }
 
     string ub_name = name + "#ub";
@@ -377,8 +374,7 @@ void State::syncSEdataWithSrc(const State &src) {
     }
   }
 
-  // The bid of tgt global starts with num_nonlocals_src
-  Memory::resetBids(num_nonlocals_src, false);
+  memory.syncWithSrc(src.returnMemory());
 }
 
 void State::mkAxioms(State &tgt) {

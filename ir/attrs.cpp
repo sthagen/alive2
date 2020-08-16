@@ -10,7 +10,7 @@ ostream& operator<<(ostream &os, const ParamAttrs &attr) {
   if (attr.has(ParamAttrs::NonNull))
     os << "nonnull ";
   if (attr.has(ParamAttrs::ByVal))
-    os << "byval ";
+    os << "byval(" << attr.blockSize << ") ";
   if (attr.has(ParamAttrs::NoCapture))
     os << "nocapture ";
   if (attr.has(ParamAttrs::ReadOnly))
@@ -19,6 +19,10 @@ ostream& operator<<(ostream &os, const ParamAttrs &attr) {
     os << "readnone ";
   if (attr.has(ParamAttrs::Dereferenceable))
     os << "dereferenceable(" << attr.derefBytes << ") ";
+  if (attr.has(ParamAttrs::NoUndef))
+    os << "noundef ";
+  if (attr.has(ParamAttrs::Align))
+    os << "align(" << attr.align << ") ";
   return os;
 }
 
@@ -40,6 +44,8 @@ ostream& operator<<(ostream &os, const FnAttrs &attr) {
     os << " nonnull";
   if (attr.has(FnAttrs::NoFree))
     os << " nofree";
+  if (attr.has(FnAttrs::NoUndef))
+    os << " noundef";
   return os;
 }
 

@@ -156,6 +156,8 @@ BinOp::BinOp(Type &type, string &&name, Value &lhs, Value &rhs, Op op,
   case UAdd_Sat:
   case SSub_Sat:
   case USub_Sat:
+  case SShl_Sat:
+  case UShl_Sat:
   case And:
   case Or:
   case Xor:
@@ -167,6 +169,11 @@ BinOp::BinOp(Type &type, string &&name, Value &lhs, Value &rhs, Op op,
   case USub_Overflow:
   case SMul_Overflow:
   case UMul_Overflow:
+  case UMin:
+  case UMax:
+  case SMin:
+  case SMax:
+  case Abs:
     assert(flags == None);
     assert(fmath.isNone());
     break;
@@ -199,6 +206,8 @@ void BinOp::print(ostream &os) const {
   case UAdd_Sat:      str = "uadd_sat "; break;
   case SSub_Sat:      str = "ssub_sat "; break;
   case USub_Sat:      str = "usub_sat "; break;
+  case SShl_Sat:      str = "sshl_sat "; break;
+  case UShl_Sat:      str = "ushl_sat "; break;
   case And:           str = "and "; break;
   case Or:            str = "or "; break;
   case Xor:           str = "xor "; break;
@@ -217,6 +226,13 @@ void BinOp::print(ostream &os) const {
   case FRem:          str = "frem "; break;
   case FMax:          str = "fmax "; break;
   case FMin:          str = "fmin "; break;
+  case UMin:          str = "umin "; break;
+  case UMax:          str = "umax "; break;
+  case SMin:          str = "smin "; break;
+  case SMax:          str = "smax "; break;
+  case Abs:
+    str = "abs ";
+    break;
   }
 
   os << getName() << " = " << str;
@@ -429,6 +445,18 @@ StateValue BinOp::toSMT(State &s) const {
     };
     break;
 
+  case SShl_Sat:
+    fn = [](auto a, auto ap, auto b, auto bp) -> StateValue {
+      return {a.sshl_sat(b), b.ult(b.bits())};
+    };
+    break;
+
+  case UShl_Sat:
+    fn = [](auto a, auto ap, auto b, auto bp) -> StateValue {
+      return {a.ushl_sat(b), b.ult(b.bits())};
+    };
+    break;
+
   case And:
     fn = [](auto a, auto ap, auto b, auto bp) -> StateValue {
       return { a & b, true };
@@ -558,6 +586,38 @@ StateValue BinOp::toSMT(State &s) const {
       return fm_poison(s, a, b, v, fmath, false);
     };
     break;
+
+  case UMin:
+  case UMax:
+  case SMin:
+  case SMax:
+    fn = [&](auto a, auto ap, auto b, auto bp) -> StateValue {
+      expr v;
+      switch (op) {
+      case UMin:
+        v = a.umin(b);
+        break;
+      case UMax:
+        v = a.umax(b);
+        break;
+      case SMin:
+        v = a.smin(b);
+        break;
+      case SMax:
+        v = a.smax(b);
+        break;
+      default:
+        UNREACHABLE();
+      }
+      return { move(v), ap && bp };
+    };
+    break;
+
+  case Abs:
+    fn = [&](auto a, auto ap, auto b, auto bp) -> StateValue {
+      return { a.abs(), ap && bp && (b == 0 || a != expr::IntSMin(a.bits())) };
+    };
+    break;
   }
 
   function<pair<StateValue,StateValue>(const expr&, const expr&, const expr&,
@@ -606,6 +666,7 @@ StateValue BinOp::toSMT(State &s) const {
         auto ai = retty->extract(a, i);
         const StateValue *bi;
         switch (op) {
+        case Abs:
         case Cttz:
         case Ctlz:
           bi = &b;
@@ -655,6 +716,7 @@ expr BinOp::getTypeConstraints(const Function &f) const {
     break;
   case Cttz:
   case Ctlz:
+  case Abs:
     instrconstr = getType().enforceIntOrVectorType() &&
                   getType() == lhs->getType() &&
                   rhs->getType().enforceIntType(1);
@@ -1405,32 +1467,104 @@ void FnCall::print(ostream &os) const {
     os << "\t; WARNING: unknown known function";
 }
 
-static void unpack_inputs(State&s, Type &ty, const ParamAttrs &argflag,
-                          const StateValue &value, vector<StateValue> &inputs,
+static expr eq_except_padding(const Type &ty, const expr &e1, const expr &e2) {
+  const auto *aty = ty.getAsAggregateType();
+  if (!aty)
+    return e1 == e2;
+
+  StateValue sv1{expr(e1), expr()};
+  StateValue sv2{expr(e2), expr()};
+  expr result = true;
+
+  for (unsigned i = 0; i < aty->numElementsConst(); ++i) {
+    if (aty->isPadding(i))
+      continue;
+
+    result &= eq_except_padding(aty->getChild(i), aty->extract(sv1, i).value,
+                                aty->extract(sv2, i).value);
+  }
+  return result;
+}
+
+static expr not_poison_except_padding(const Type &ty, const expr &np) {
+  const auto *aty = ty.getAsAggregateType();
+  if (!aty) {
+    assert(np.isBool() && "non-aggregates should have boolean poison");
+    return np;
+  }
+
+  StateValue sv{expr(), expr(np)};
+  expr result = true;
+
+  for (unsigned i = 0; i < aty->numElementsConst(); ++i) {
+    if (aty->isPadding(i))
+      continue;
+
+    result &= not_poison_except_padding(aty->getChild(i),
+                                        aty->extract(sv, i).non_poison);
+  }
+  return result;
+}
+
+static pair<expr,expr> // <extracted value, not_undef>
+strip_undef(State &s, const Value &val, const expr &e) {
+  if (s.isUndef(e))
+    return { expr::mkUInt(0, e), false };
+
+  expr c, a, b, lhs, rhs, ty;
+  unsigned h, l;
+
+  // (ite (= ((_ extract 0 0) ty_%var) #b0) %var undef!0)
+  if (e.isIf(c, a, b) && s.isUndef(b) && c.isEq(lhs, rhs)) {
+    if (lhs.isZero())
+      swap(lhs, rhs);
+
+    if (rhs.isZero() &&
+        lhs.isExtract(ty, h, l) && h == 0 && l == 0 && isTyVar(ty, a))
+      return { move(a), move(c) };
+  }
+
+  return { e, eq_except_padding(val.getType(), e, s[val].value) };
+}
+
+static void unpack_inputs(State &s, Value &argv, Type &ty,
+                          const ParamAttrs &argflag,
+                          StateValue value, vector<StateValue> &inputs,
                           vector<Memory::PtrInput> &ptr_inputs) {
   if (auto agg = ty.getAsAggregateType()) {
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
-      unpack_inputs(s, agg->getChild(i), argflag, agg->extract(value, i),
+      unpack_inputs(s, argv, agg->getChild(i), argflag, agg->extract(value, i),
                     inputs, ptr_inputs);
     }
   } else {
+    bool is_deref = argflag.has(ParamAttrs::Dereferenceable);
+    bool is_nonnull = argflag.has(ParamAttrs::NonNull);
+    bool is_noundef = argflag.has(ParamAttrs::NoUndef);
+
+    if (is_deref || is_nonnull || is_noundef)
+      s.addUB(not_poison_except_padding(ty, value.non_poison));
+
+    if (is_noundef) {
+      auto [val, not_undef] = strip_undef(s, argv, value.value);
+      value.value = move(val);
+      s.addUB(move(not_undef));
+    }
+
     if (ty.isPtrType()) {
-      Pointer p(s.getMemory(), value.value);
+      Pointer p(s.getMemory(), move(value.value));
       p.stripAttrs();
-      if (argflag.has(ParamAttrs::Dereferenceable)) {
-        s.addUB(value.non_poison);
+      if (is_deref)
         s.addUB(
-          p.isDereferenceable(argflag.getDerefBytes(), bits_byte / 8, false));
-      }
-      if (argflag.has(ParamAttrs::NonNull)) {
-        s.addUB(value.non_poison);
+          p.isDereferenceable(argflag.derefBytes, bits_byte / 8, false));
+
+      if (is_nonnull)
         s.addUB(p.isNonZero());
-      }
-      ptr_inputs.emplace_back(StateValue(p.release(), expr(value.non_poison)),
+
+      ptr_inputs.emplace_back(StateValue(p.release(), move(value.non_poison)),
                               argflag.has(ParamAttrs::ByVal),
                               argflag.has(ParamAttrs::NoCapture));
     } else {
-      inputs.emplace_back(value);
+      inputs.emplace_back(move(value));
     }
   }
 }
@@ -1438,6 +1572,9 @@ static void unpack_inputs(State&s, Type &ty, const ParamAttrs &argflag,
 static void unpack_ret_ty (vector<Type*> &out_types, Type &ty) {
   if (auto agg = ty.getAsAggregateType()) {
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
+      // Padding is automatically filled with poison
+      if (agg->isPadding(i))
+        continue;
       unpack_ret_ty(out_types, agg->getChild(i));
     }
   } else {
@@ -1451,9 +1588,12 @@ pack_return(State &s, Type &ty, vector<StateValue> &vals, const FnAttrs &attrs,
   if (auto agg = ty.getAsAggregateType()) {
     vector<StateValue> vs;
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
+      // Padding is automatically filled with poison
+      if (agg->isPadding(i))
+        continue;
       vs.emplace_back(pack_return(s, agg->getChild(i), vals, attrs, idx));
     }
-    return agg->aggregateVals(vs);
+    return agg->aggregateVals(vs, true);
   }
 
   auto &ret = vals[idx++];
@@ -1487,7 +1627,7 @@ StateValue FnCall::toSMT(State &s) const {
   ostringstream fnName_mangled;
   fnName_mangled << fnName;
   for (auto &[arg, flags] : args) {
-    unpack_inputs(s, arg->getType(), flags, s[*arg], inputs, ptr_inputs);
+    unpack_inputs(s, *arg, arg->getType(), flags, s[*arg], inputs, ptr_inputs);
     fnName_mangled << '#' << arg->getType();
   }
   fnName_mangled << '!' << getType();
@@ -1790,6 +1930,15 @@ void Phi::addValue(Value &val, string &&BB_name) {
   values.emplace_back(&val, move(BB_name));
 }
 
+void Phi::removeValue(const string &BB_name) {
+  for (auto I = values.begin(), E = values.end(); I != E; ++I) {
+    if (I->second == BB_name) {
+      values.erase(I);
+      break;
+    }
+  }
+}
+
 vector<Value*> Phi::operands() const {
   vector<Value*> v;
   for (auto &[val, bb] : values) {
@@ -1894,32 +2043,10 @@ void Branch::print(ostream &os) const {
     os << ", label " << dst_false->getName();
 }
 
-static pair<expr,expr> // <condition, not_undef>
-jump_undef_condition(State &s, const Value &val, const expr &e) {
-  if (s.isUndef(e))
-    return { expr::mkUInt(0, 1), false };
-
-  expr c, a, b, lhs, rhs, ty;
-  unsigned h, l;
-  uint64_t n;
-
-  // (ite (= ((_ extract 0 0) ty_%var) #b0) %var undef!0)
-  if (e.isIf(c, a, b) && s.isUndef(b) && c.isEq(lhs, rhs)) {
-    if (lhs.isUInt(n))
-      swap(lhs, rhs);
-
-    if (rhs.isUInt(n) && n == 0 &&
-        lhs.isExtract(ty, h, l) && h == 0 && l == 0 && isTyVar(ty, a))
-      return { move(a), c };
-  }
-
-  return { e, e == s[val].value };
-}
-
 StateValue Branch::toSMT(State &s) const {
   if (cond) {
     auto &c = s[*cond];
-    auto [cond_val, not_undef] = jump_undef_condition(s, *cond, c.value);
+    auto [cond_val, not_undef] = strip_undef(s, *cond, c.value);
     s.addUB(c.non_poison);
     s.addUB(move(not_undef));
     s.addCondJump(cond_val, dst_true, *dst_false);
@@ -1975,7 +2102,7 @@ StateValue Switch::toSMT(State &s) const {
   auto &val = s[*value];
   expr default_cond(true);
 
-  auto [cond_val, not_undef] = jump_undef_condition(s, *value, val.value);
+  auto [cond_val, not_undef] = strip_undef(s, *value, val.value);
   s.addUB(val.non_poison);
   s.addUB(move(not_undef));
 
@@ -2041,28 +2168,40 @@ static void addUBForNoCaptureRet(State &s, const StateValue &svret,
 
 StateValue Return::toSMT(State &s) const {
   // Encode nocapture semantics.
-  auto &retval = s[*val];
+  auto retval = s[*val];
   s.addUB(s.getMemory().checkNocapture());
   addUBForNoCaptureRet(s, retval, val->getType());
 
   auto &attrs = s.getFn().getFnAttrs();
   bool isDeref = attrs.has(FnAttrs::Dereferenceable);
   bool isNonNull = attrs.has(FnAttrs::NonNull);
+  bool isNoUndef = attrs.has(FnAttrs::NoUndef);
+
+  if (isNoUndef) {
+    auto [value, not_undef] = strip_undef(s, *val, retval.value);
+    retval.value = move(value);
+    s.addUB(move(not_undef));
+  }
+
   if (isDeref || isNonNull) {
     assert(val->getType().isPtrType());
     Pointer p(s.getMemory(), retval.value);
-    s.addUB(retval.non_poison);
 
     if (isDeref) {
       s.addUB(p.isDereferenceable(attrs.getDerefBytes()));
-      s.addUB(p.getAllocType() != Pointer::STACK || !has_alloca);
+      if (has_alloca)
+        s.addUB(p.getAllocType() != Pointer::STACK);
     }
     if (isNonNull) {
       s.addUB(p.isNonZero());
     }
   }
 
-  s.addReturn(retval);
+  if (isDeref || isNonNull || isNoUndef) {
+    s.addUB(not_poison_except_padding(val->getType(), retval.non_poison));
+  }
+
+  s.addReturn(move(retval));
   return {};
 }
 
@@ -2117,19 +2256,18 @@ MemInstr::ByteAccessInfo::intOnly(unsigned bytesz) {
 
 MemInstr::ByteAccessInfo
 MemInstr::ByteAccessInfo::get(const Type &t, bool store, unsigned align) {
+  bool ptr_access = hasPtr(t);
   ByteAccessInfo info;
   info.hasIntByteAccess = t.enforcePtrOrVectorType().isFalse();
-  info.hasPtrByteAccess = hasPtr(t);
-  info.doesPtrStore = info.hasPtrByteAccess && store;
-  info.doesPtrLoad = info.hasPtrByteAccess && !store;
-  info.byteSize = gcd(align, getCommonAccessSize(t));
-  info.hasSubByteAccess = hasSubByte(t);
+  info.doesPtrStore     = ptr_access && store;
+  info.doesPtrLoad      = ptr_access && !store;
+  info.byteSize         = gcd(align, getCommonAccessSize(t));
   return info;
 }
 
 MemInstr::ByteAccessInfo
-MemInstr::ByteAccessInfo::full(unsigned byteSize, bool subByte) {
-  return { true, true, true, true, byteSize, subByte };
+MemInstr::ByteAccessInfo::full(unsigned byteSize) {
+  return { true, true, true, byteSize };
 }
 
 
@@ -2686,7 +2824,7 @@ Memcpy::ByteAccessInfo Memcpy::getByteAccessInfo() const {
   // FIXME: memcpy doesn't have multi-byte support
   // Memcpy does not have sub-byte access, unless the sub-byte type appears
   // at other instructions
-  return ByteAccessInfo::full(byteSize, false);
+  return ByteAccessInfo::full(byteSize);
 }
 
 vector<Value*> Memcpy::operands() const {

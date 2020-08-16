@@ -15,6 +15,8 @@ extern unsigned num_consts_src;
 
 extern unsigned num_globals_src;
 
+extern unsigned num_ptrinputs;
+
 /// Number of non-constant globals introduced in tgt
 extern unsigned num_extra_nonconst_tgt;
 
@@ -23,6 +25,8 @@ extern unsigned num_nonlocals;
 
 // Upperbound of the number of nonlocal blocks in src (<= num_nonlocals)
 extern unsigned num_nonlocals_src;
+
+extern unsigned bits_poison_per_byte;
 
 /// Number of bits needed for attributes of pointers (e.g. nocapture).
 extern unsigned bits_for_ptrattrs;
@@ -75,9 +79,6 @@ extern bool has_null_block;
 extern bool does_int_mem_access;
 extern bool does_ptr_mem_access;
 extern bool does_ptr_store;
-
-/// Whether the programs do memory accesses of less than bits_byte
-extern bool does_sub_byte_access;
 
 extern unsigned heap_block_alignment;
 

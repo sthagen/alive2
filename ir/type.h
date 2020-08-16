@@ -279,6 +279,7 @@ public:
 
   unsigned bits() const override;
   unsigned np_bits() const override;
+  // Padding is filled with poison regardless of non_poison.
   IR::StateValue getDummyValue(bool non_poison) const override;
   smt::expr getTypeConstraints() const override;
   smt::expr sizeVar() const override;
@@ -328,6 +329,7 @@ public:
   IR::StateValue update(const IR::StateValue &vector,
                         const IR::StateValue &val,
                         const smt::expr &idx) const;
+  unsigned np_bits() const override;
   smt::expr getTypeConstraints() const override;
   smt::expr scalarSize() const override;
   bool isVectorType() const override;
@@ -416,6 +418,6 @@ public:
 
 bool hasPtr(const Type &t);
 bool isNonPtrVector(const Type &t);
-bool hasSubByte(const Type &t);
+unsigned minVectorElemSize(const Type &t);
 uint64_t getCommonAccessSize(const Type &ty);
 }

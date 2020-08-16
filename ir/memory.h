@@ -8,6 +8,7 @@
 #include "ir/type.h"
 #include "smt/expr.h"
 #include "smt/exprs.h"
+#include <map>
 #include <optional>
 #include <ostream>
 #include <set>
@@ -192,12 +193,42 @@ public:
   smt::expr isNull() const;
   smt::expr isNonZero() const;
 
+  // for container use only
+  bool operator<(const Pointer &rhs) const;
+
   friend std::ostream& operator<<(std::ostream &os, const Pointer &p);
 };
 
 
 class Memory {
   State *state;
+
+  class AliasSet {
+    std::vector<bool> local, non_local;
+
+  public:
+    AliasSet(const Memory &m); // no alias
+    size_t size(bool local) const;
+
+    int isFullUpToAlias(bool local) const; // >= 0 if up to
+    bool mayAlias(bool local, unsigned bid) const;
+    unsigned numMayAlias(bool local) const;
+
+    void setMayAlias(bool local, unsigned bid);
+    void setMayAliasUpTo(bool local, unsigned limit); // [0, limit]
+    void setNoAlias(bool local, unsigned bid);
+
+    void intersectWith(const AliasSet &other);
+    void unionWith(const AliasSet &other);
+
+    void computeAccessStats() const;
+    static void printStats(std::ostream &os);
+
+    // for container use only
+    bool operator<(const AliasSet &rhs) const;
+
+    void print(std::ostream &os) const;
+  };
 
   enum DataType { DATA_NONE = 0, DATA_INT = 1, DATA_PTR = 2,
                   DATA_ANY = DATA_INT | DATA_PTR };
@@ -234,7 +265,14 @@ class Memory {
   smt::FunctionExpr non_local_blk_kind;
 
   std::vector<unsigned> byval_blks;
-  std::vector<bool> escaped_local_blks;
+  AliasSet escaped_local_blks;
+
+  std::map<smt::expr, AliasSet> ptr_alias; // blockid -> alias
+  unsigned next_nonlocal_bid;
+  unsigned nextNonlocalBid();
+
+  unsigned numLocals() const;
+  unsigned numNonlocals() const;
 
   void mk_nonlocal_val_axioms(bool skip_consts);
 
@@ -243,14 +281,14 @@ class Memory {
 
   template <typename Fn>
   void access(const Pointer &ptr, unsigned btyes, unsigned align, bool write,
-              Fn &fn) const;
+              Fn &fn);
 
   std::vector<Byte> load(const Pointer &ptr, unsigned bytes,
                          std::set<smt::expr> &undef, unsigned align,
                          bool left2right = true,
-                         DataType type = DATA_ANY) const;
+                         DataType type = DATA_ANY);
   StateValue load(const Pointer &ptr, const Type &type,
-                  std::set<smt::expr> &undef, unsigned align) const;
+                  std::set<smt::expr> &undef, unsigned align);
 
   DataType data_type(const std::vector<std::pair<unsigned, smt::expr>> &data,
                      bool full_store) const;
@@ -292,10 +330,11 @@ public:
 
   void mkAxioms(const Memory &other) const;
 
-  static void resetBids(unsigned last_nonlocal, bool is_source);
+  static void resetGlobals();
+  void syncWithSrc(const Memory &src);
 
   void markByVal(unsigned bid);
-  smt::expr mkInput(const char *name, const ParamAttrs &attrs) const;
+  smt::expr mkInput(const char *name, const ParamAttrs &attrs);
   std::pair<smt::expr, smt::expr> mkUndefInput(const ParamAttrs &attrs) const;
 
   struct PtrInput {
@@ -312,8 +351,7 @@ public:
   };
 
   std::pair<smt::expr, smt::expr>
-    mkFnRet(const char *name,
-            const std::vector<PtrInput> &ptr_inputs) const;
+    mkFnRet(const char *name, const std::vector<PtrInput> &ptr_inputs);
   CallState mkCallState(const std::vector<PtrInput> *ptr_inputs, bool nofree)
       const;
   void setState(const CallState &st);
@@ -339,12 +377,11 @@ public:
   static unsigned getStoreByteSize(const Type &ty);
   void store(const smt::expr &ptr, const StateValue &val, const Type &type,
              unsigned align, const std::set<smt::expr> &undef_vars);
-  std::pair<StateValue, smt::AndExpr> load(const smt::expr &ptr,
-      const Type &type, unsigned align) const;
+  std::pair<StateValue, smt::AndExpr>
+    load(const smt::expr &ptr, const Type &type, unsigned align);
 
   // raw load
-  Byte load(const Pointer &p, std::set<smt::expr> &undef_vars,
-            unsigned align) const;
+  Byte load(const Pointer &p, std::set<smt::expr> &undef_vars, unsigned align);
 
   void memset(const smt::expr &ptr, const StateValue &val,
               const smt::expr &bytesize, unsigned align,
@@ -369,19 +406,18 @@ public:
   smt::expr checkNocapture() const;
   void escapeLocalPtr(const smt::expr &ptr);
 
-  unsigned numLocals() const;
-  unsigned numNonlocals() const;
-
   static Memory mkIf(const smt::expr &cond, const Memory &then,
                      const Memory &els);
-
-  static void resetState();
 
   // for container use only
   bool operator<(const Memory &rhs) const;
 
+  static void printAliasStats(std::ostream &os) {
+    AliasSet::printStats(os);
+  }
+
   void print(std::ostream &os, const smt::Model &m) const;
-  friend std::ostream &operator<<(std::ostream &os, const Memory &m);
+  friend std::ostream& operator<<(std::ostream &os, const Memory &m);
 
   friend class Pointer;
 };

@@ -6,6 +6,8 @@
 # include <intrin.h>
 #endif
 
+using namespace std;
+
 namespace util {
 
 unsigned ilog2(uint64_t n) {

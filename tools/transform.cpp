@@ -290,22 +290,6 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   AndExpr axioms = src_state.getAxioms();
   axioms.add(tgt_state.getAxioms());
 
-  // restrict type variable from taking disabled values
-  if (config::disable_undef_input || config::disable_poison_input) {
-    for (auto &i : t.src.getInputs()) {
-      if (auto in = dynamic_cast<const Input*>(&i)) {
-        auto var = in->getTyVar();
-        if (config::disable_undef_input) {
-          if (config::disable_poison_input)
-            axioms.add(var == 0);
-          else
-            axioms.add(var != 1);
-        } else if (config::disable_poison_input)
-          axioms.add(var.extract(1, 1) == 0);
-      }
-    }
-  }
-
   // note that precondition->toSMT() may add stuff to getPre,
   // so order here matters
   // FIXME: broken handling of transformation precondition
@@ -540,9 +524,14 @@ static void calculateAndInitConstants(Transform &t) {
     }
   }
 
-  unsigned num_ptrinputs = 0;
+  num_ptrinputs = 0;
   for (auto &arg : t.src.getInputs()) {
-    num_ptrinputs += num_ptrs(arg.getType());
+    auto n = num_ptrs(arg.getType());
+    if (dynamic_cast<const Input*>(&arg)->hasAttribute(ParamAttrs::ByVal)) {
+      num_globals_src += n;
+      num_globals += n;
+    } else
+      num_ptrinputs += n;
   }
 
   // The number of instructions that can return a pointer to a non-local block.
@@ -553,6 +542,7 @@ static void calculateAndInitConstants(Transform &t) {
   uint64_t max_gep_src = 0, max_gep_tgt = 0;
   uint64_t max_alloc_size = 0;
   uint64_t max_access_size = 0;
+  uint64_t min_global_size = UINT64_MAX;
 
   bool nullptr_is_used = false;
   has_int2ptr      = false;
@@ -569,9 +559,9 @@ static void calculateAndInitConstants(Transform &t) {
 
   // Mininum access size (in bytes)
   uint64_t min_access_size = 8;
+  unsigned min_vect_elem_sz = 0;
   bool does_mem_access = false;
   bool has_ptr_load = false;
-  does_sub_byte_access = false;
   bool has_vector_bitcast = false;
 
   for (auto fn : { &t.src, &t.tgt }) {
@@ -584,11 +574,28 @@ static void calculateAndInitConstants(Transform &t) {
       auto *i = dynamic_cast<const Input *>(&v);
       if (i && i->hasAttribute(ParamAttrs::Dereferenceable)) {
         does_mem_access = true;
-        uint64_t deref_bytes = i->getAttributes().getDerefBytes();
+        uint64_t deref_bytes = i->getAttributes().derefBytes;
         min_access_size = gcd(min_access_size, deref_bytes);
         max_access_size = max(max_access_size, deref_bytes);
       }
+      if (i && i->hasAttribute(ParamAttrs::ByVal)) {
+        does_mem_access = true;
+        auto sz = i->getAttributes().blockSize;
+        max_access_size = max(max_access_size, sz);
+        min_global_size = min_global_size != UINT64_MAX
+                            ? gcd(sz, min_global_size)
+                            : sz;
+        min_global_size = gcd(min_global_size, i->getAttributes().align);
+      }
     }
+
+    auto update_min_vect_sz = [&](const Type &ty) {
+      auto elemsz = minVectorElemSize(ty);
+      if (min_vect_elem_sz && elemsz)
+        min_vect_elem_sz = gcd(min_vect_elem_sz, elemsz);
+      else if (elemsz)
+        min_vect_elem_sz = elemsz;
+    };
 
     set<pair<Value*, uint64_t>> nonlocal_cache;
     for (auto BB : fn->getBBs()) {
@@ -600,7 +607,10 @@ static void calculateAndInitConstants(Transform &t) {
 
         for (auto op : i.operands()) {
           nullptr_is_used |= has_nullptr(op);
+          update_min_vect_sz(op->getType());
         }
+
+        update_min_vect_sz(i.getType());
 
         if (auto *fc = dynamic_cast<const FnCall*>(&i)) {
           has_fncall |= true;
@@ -616,8 +626,6 @@ static void calculateAndInitConstants(Transform &t) {
           has_ptr_load         |= info.doesPtrLoad;
           does_ptr_store       |= info.doesPtrStore;
           does_int_mem_access  |= info.hasIntByteAccess;
-          does_ptr_mem_access  |= info.hasPtrByteAccess;
-          does_sub_byte_access |= info.hasSubByteAccess;
           does_mem_access      |= info.doesMemAccess();
           min_access_size       = gcd(min_access_size, info.byteSize);
 
@@ -642,15 +650,16 @@ static void calculateAndInitConstants(Transform &t) {
         } else if (auto *bc = isCast(ConversionOp::BitCast, i)) {
           auto &t = bc->getType();
           has_vector_bitcast |= t.isVectorType();
-          does_sub_byte_access |= hasSubByte(t);
           min_access_size = gcd(min_access_size, getCommonAccessSize(t));
         }
       }
     }
   }
+
+  does_ptr_mem_access = has_ptr_load || does_ptr_store;
+
   unsigned num_locals = max(num_locals_src, num_locals_tgt);
 
-  uint64_t min_global_size = UINT64_MAX;
   for (auto glbs : { &globals_src, &globals_tgt }) {
     for (auto &glb : *glbs) {
       auto sz = max(glb->size(), (uint64_t)1u);
@@ -667,14 +676,7 @@ static void calculateAndInitConstants(Transform &t) {
   has_null_block = num_ptrinputs > 0 || nullptr_is_used || has_malloc ||
                   has_ptr_load || has_fncall;
 
-  // + 1 is sufficient to give 1 degree of freedom for the target to trigger UB
-  // in case a different pointer from source is produced.
-  auto num_max_nonlocals_inst
-    = max(num_nonlocals_inst_src, num_nonlocals_inst_tgt);
-  if (num_nonlocals_inst_src && num_nonlocals_inst_tgt)
-    ++num_max_nonlocals_inst;
-
-  num_nonlocals_src = num_globals_src + num_ptrinputs + num_max_nonlocals_inst +
+  num_nonlocals_src = num_globals_src + num_ptrinputs + num_nonlocals_inst_src +
                       has_null_block;
 
   // Allow at least one non-const global for calls to change
@@ -697,7 +699,6 @@ static void calculateAndInitConstants(Transform &t) {
   };
   // The number of bits needed to encode pointer attributes
   // nonnull and byval isn't encoded in ptr attribute bits
-  bool has_byval = has_attr(ParamAttrs::ByVal);
   has_nocapture = has_attr(ParamAttrs::NoCapture);
   has_readonly = has_attr(ParamAttrs::ReadOnly);
   has_readnone = has_attr(ParamAttrs::ReadNone);
@@ -734,10 +735,13 @@ static void calculateAndInitConstants(Transform &t) {
       }
     }
   }
-  if (has_byval)
-    min_access_size = 1;
   bits_byte = 8 * ((does_mem_access || num_globals != 0)
                      ? (unsigned)min_access_size : 1);
+
+  bits_poison_per_byte = 1;
+  if (min_vect_elem_sz > 0)
+    bits_poison_per_byte = (min_vect_elem_sz % 8) ? bits_byte :
+                             bits_byte / gcd(bits_byte, min_vect_elem_sz);
 
   strlen_unroll_cnt = 10;
   memcmp_unroll_cnt = 10;
@@ -745,8 +749,7 @@ static void calculateAndInitConstants(Transform &t) {
   little_endian = t.src.isLittleEndian();
 
   if (config::debug)
-    config::dbg() << "num_max_nonlocals_inst: " << num_max_nonlocals_inst
-                  << "\nnum_locals_src: " << num_locals_src
+    config::dbg() << "\nnum_locals_src: " << num_locals_src
                   << "\nnum_locals_tgt: " << num_locals_tgt
                   << "\nnum_nonlocals_src: " << num_nonlocals_src
                   << "\nnum_nonlocals: " << num_nonlocals
@@ -758,6 +761,7 @@ static void calculateAndInitConstants(Transform &t) {
                   << "\nmin_access_size: " << min_access_size
                   << "\nmax_access_size: " << max_access_size
                   << "\nbits_byte: " << bits_byte
+                  << "\nbits_poison_per_byte: " << bits_poison_per_byte
                   << "\nstrlen_unroll_cnt: " << strlen_unroll_cnt
                   << "\nmemcmp_unroll_cnt: " << memcmp_unroll_cnt
                   << "\nlittle_endian: " << little_endian
@@ -771,7 +775,6 @@ static void calculateAndInitConstants(Transform &t) {
                   << "\ndoes_mem_access: " << does_mem_access
                   << "\ndoes_ptr_mem_access: " << does_ptr_mem_access
                   << "\ndoes_int_mem_access: " << does_int_mem_access
-                  << "\ndoes_sub_byte_access: " << does_sub_byte_access
                   << '\n';
 }
 
@@ -827,7 +830,6 @@ Errors TransformVerify::verify() const {
   StopWatch symexec_watch;
   calculateAndInitConstants(t);
   State::resetGlobals();
-  State::cleanup_state cleanup;
   State src_state(t.src, true), tgt_state(t.tgt, false);
 
   try {
@@ -996,7 +998,45 @@ static map<string_view, Instr*> can_remove_init(Function &fn) {
   return to_remove;
 }
 
+static void remove_unreachable_bbs(Function &f) {
+  vector<BasicBlock*> wl = { &f.getFirstBB() };
+  set<BasicBlock*> reachable;
+
+  do {
+    auto bb = wl.back();
+    wl.pop_back();
+    if (!reachable.emplace(bb).second)
+      continue;
+
+    if (auto instr = dynamic_cast<JumpInstr*>(&bb->back())) {
+      for (auto &target : instr->targets()) {
+        wl.emplace_back(const_cast<BasicBlock*>(&target));
+      }
+    }
+  } while (!wl.empty());
+
+  auto all_bbs = f.getBBs(); // copy intended
+  vector<string> unreachable;
+  for (auto bb : all_bbs) {
+    if (!reachable.count(bb)) {
+      unreachable.emplace_back(bb->getName());
+      f.removeBB(*bb);
+    }
+  }
+
+  for (auto &i : f.instrs()) {
+    if (auto phi = dynamic_cast<const Phi*>(&i)) {
+      for (auto &bb : unreachable) {
+        const_cast<Phi*>(phi)->removeValue(bb);
+      }
+    }
+  }
+}
+
 void Transform::preprocess() {
+  remove_unreachable_bbs(src);
+  remove_unreachable_bbs(tgt);
+
   // remove store of initializers to global variables that aren't needed to
   // verify the transformation
   // We only remove inits if it's possible to remove from both programs to keep

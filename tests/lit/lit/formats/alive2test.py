@@ -6,6 +6,7 @@ import lit.util
 from .base import TestFormat
 import os, re, signal, string, subprocess
 
+ok_string = 'Transformation seems to be correct!'
 
 def executeCommand(command):
   p = subprocess.Popen(command,
@@ -30,6 +31,12 @@ def executeCommand(command):
   return out, err, exitCode
 
 
+def id_check(fn, cmd, args):
+  out, err, exitCode = executeCommand(cmd + args)
+  if exitCode != 0 or (out + err).find(ok_string) < 0:
+    raise Exception(fn + ' identity check fail: ' + out + err)
+
+
 def readFile(path):
   fd = open(path, 'r')
   return fd.read()
@@ -42,6 +49,7 @@ class Alive2Test(TestFormat):
     self.regex_args = re.compile(r";\s*TEST-ARGS:(.*)")
     self.regex_check = re.compile(r";\s*CHECK:(.*)")
     self.regex_check_not = re.compile(r";\s*CHECK-NOT:(.*)")
+    self.regex_skip_identity = re.compile(r";\s*SKIP-IDENTITY")
     self.regex_errs_out = re.compile("ERROR:.*")
 
   def getTestsInDirectory(self, testSuite, path_in_suite,
@@ -58,7 +66,6 @@ class Alive2Test(TestFormat):
 
   def execute(self, test, litConfig):
     test = test.getSourcePath()
-    ok_string = 'Transformation seems to be correct!'
 
     alive_tv_1 = test.endswith('.srctgt.ll')
     if alive_tv_1:
@@ -82,23 +89,23 @@ class Alive2Test(TestFormat):
     if m != None:
       cmd += m.group(1).split()
 
-    if alive_tv_2:
-       # Run identity check first
-       srcpath = test
-       invalid_expr = 'Invalid expr'
-       resultchk = lambda msg, exitCode: \
-           (exitCode == 0 and msg.find(ok_string) != -1) or \
-           (exitCode != 0 and msg.find(invalid_expr) != -1)
+    do_identity = self.regex_skip_identity.search(input) is None
 
-       out, err, exitCode = executeCommand(cmd + [srcpath, srcpath])
-       if not resultchk(out + err, exitCode):
-         return lit.Test.FAIL, 'src identity check fail: ' + out + err
+    # Run identity check first
+    if alive_tv_1 and do_identity:
+      try:
+        id_check('src', cmd, [test, '-src-fn=src', '-tgt-fn=src'])
+        id_check('tgt', cmd, [test, '-src-fn=tgt', '-tgt-fn=tgt'])
+      except Exception as e:
+        return lit.Test.FAIL, e
 
-       tgtpath = test.replace('.src.ll', '.tgt.ll')
-       out, err, exitCode = executeCommand(cmd + [tgtpath, tgtpath])
-       if not resultchk(out + err, exitCode):
-         return lit.Test.FAIL, 'tgt identity check fail: ' + out + err
-
+    if alive_tv_2 and do_identity:
+      try:
+        id_check('src', cmd, [test, test])
+        tgtpath = test.replace('.src.ll', '.tgt.ll')
+        id_check('tgt', cmd, [tgtpath, tgtpath])
+      except Exception as e:
+        return lit.Test.FAIL, e
 
     cmd.append(test)
     if alive_tv_2:

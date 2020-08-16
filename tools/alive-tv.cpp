@@ -2,6 +2,7 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include "llvm_util/llvm2alive.h"
+#include "ir/memory.h"
 #include "smt/smt.h"
 #include "tools/transform.h"
 #include "util/config.h"
@@ -76,6 +77,14 @@ static llvm::cl::list<std::string> opt_funcs(
     llvm::cl::ZeroOrMore, llvm::cl::value_desc("function name"),
     llvm::cl::cat(opt_alive));
 
+static llvm::cl::opt<std::string> opt_src_fn(
+    "src-fn", llvm::cl::desc("Name of src function (without @)"),
+    llvm::cl::cat(opt_alive), llvm::cl::init("src"));
+
+static llvm::cl::opt<std::string> opt_tgt_fn(
+    "tgt-fn", llvm::cl::desc("Name of tgt function (without @)"),
+    llvm::cl::cat(opt_alive), llvm::cl::init("tgt"));
+
 static llvm::cl::opt<bool> opt_tactic_verbose(
     "tactic-verbose", llvm::cl::desc("SMT Tactic verbose mode"),
     llvm::cl::cat(opt_alive), llvm::cl::init(false));
@@ -86,6 +95,10 @@ static llvm::cl::opt<bool> opt_debug(
 
 static llvm::cl::opt<bool> opt_smt_stats(
     "smt-stats", llvm::cl::desc("Show SMT statistics"),
+    llvm::cl::cat(opt_alive), llvm::cl::init(false));
+
+static llvm::cl::opt<bool> opt_alias_stats(
+    "alias-stats", llvm::cl::desc("Show alias sets statistics"),
     llvm::cl::cat(opt_alive), llvm::cl::init(false));
 
 static llvm::cl::opt<bool> opt_succinct(
@@ -426,8 +439,8 @@ convenient way to demonstrate an existing optimizer bug.
 
   unique_ptr<llvm::Module> M2;
   if (opt_file2.empty()) {
-    auto SRC = findFunction(*M1, "src");
-    auto TGT = findFunction(*M1, "tgt");
+    auto SRC = findFunction(*M1, opt_src_fn);
+    auto TGT = findFunction(*M1, opt_tgt_fn);
     if (SRC && TGT) {
       auto &DL = M1.get()->getDataLayout();
       auto targetTriple = llvm::Triple(M1.get()->getTargetTriple());
@@ -486,6 +499,9 @@ end:
     smt::solver_print_stats(cout);
 
   smt_init.reset();
+
+  if (opt_alias_stats)
+    IR::Memory::printAliasStats(cout);
 
   return errorCount > 0;
 }

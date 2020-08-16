@@ -86,6 +86,38 @@ FastMathFlags parse_fmath(llvm::Instruction &i) {
 }
 
 
+template <typename Fn, typename RetFn>
+void parse_fnattrs(FnAttrs &attrs, llvm::Type *retTy, Fn &&hasAttr,
+                   RetFn &&hasRetAttr) {
+  if (hasAttr(llvm::Attribute::ReadOnly)) {
+    attrs.set(FnAttrs::NoWrite);
+    attrs.set(FnAttrs::NoFree);
+  }
+  if (hasAttr(llvm::Attribute::ReadNone)) {
+    attrs.set(FnAttrs::NoRead);
+    attrs.set(FnAttrs::NoWrite);
+    attrs.set(FnAttrs::NoFree);
+  }
+  if (hasAttr(llvm::Attribute::WriteOnly))
+    attrs.set(FnAttrs::NoRead);
+
+  if (hasAttr(llvm::Attribute::ArgMemOnly))
+    attrs.set(FnAttrs::ArgMemOnly);
+
+  if (hasAttr(llvm::Attribute::NoFree))
+    attrs.set(FnAttrs::NoFree);
+
+  if (hasAttr(llvm::Attribute::NoReturn))
+    attrs.set(FnAttrs::NoReturn);
+
+  if (hasRetAttr(llvm::Attribute::NonNull))
+    attrs.set(FnAttrs::NonNull);
+
+  if (hasRetAttr(llvm::Attribute::NoUndef))
+    attrs.set(FnAttrs::NoUndef);
+}
+
+
 class llvm2alive_ : public llvm::InstVisitor<llvm2alive_, unique_ptr<Instr>> {
   BasicBlock *BB;
   llvm::Function &f;
@@ -250,35 +282,21 @@ public:
       return error(i);
 
     FnAttrs attrs;
-    if (i.hasFnAttr(llvm::Attribute::ReadOnly)) {
-      attrs.set(FnAttrs::NoWrite);
-      attrs.set(FnAttrs::NoFree);
-    }
-    if (i.hasFnAttr(llvm::Attribute::ReadNone)) {
-      attrs.set(FnAttrs::NoRead);
-      attrs.set(FnAttrs::NoWrite);
-      attrs.set(FnAttrs::NoFree);
-    }
-    if (i.hasFnAttr(llvm::Attribute::WriteOnly))
-      attrs.set(FnAttrs::NoRead);
-    if (i.hasFnAttr(llvm::Attribute::ArgMemOnly))
-      attrs.set(FnAttrs::ArgMemOnly);
-    if (i.hasFnAttr(llvm::Attribute::NoReturn))
-      attrs.set(FnAttrs::NoReturn);
-    if (i.hasFnAttr(llvm::Attribute::NoFree))
-      attrs.set(FnAttrs::NoFree);
+    parse_fnattrs(attrs, i.getType(),
+                  [&i](auto attr) { return i.hasFnAttr(attr); },
+                  [&i](auto attr) { return i.hasRetAttr(attr); });
+
     if (auto op = dyn_cast<llvm::FPMathOperator>(&i)) {
       if (op->hasNoNaNs())
         attrs.set(FnAttrs::NNaN);
     }
+
     const auto &ret = llvm::AttributeList::ReturnIndex;
     if (uint64_t b = max(i.getDereferenceableBytes(ret),
                          i.getCalledFunction()->getDereferenceableBytes(ret))) {
       attrs.set(FnAttrs::Dereferenceable);
       attrs.setDerefBytes(b);
     }
-    if (i.hasRetAttr(llvm::Attribute::NonNull))
-      attrs.set(FnAttrs::NonNull);
 
     string fn_name = '@' + fn->getName().str();
     auto call =
@@ -309,13 +327,17 @@ public:
           derefb = max(derefb,
               i.getCalledFunction()->getParamDereferenceableBytes(argidx));
         assert(derefb);
-        attr.setDerefBytes(derefb);
+        attr.derefBytes = derefb;
       }
 
       if (i.paramHasAttr(argidx, llvm::Attribute::ByVal)) {
-        // A byval parameter cannot be captured.
-        attr.set(ParamAttrs::NoCapture);
         attr.set(ParamAttrs::ByVal);
+        auto ty = i.getParamByValType(argidx);
+        attr.blockSize = DL().getTypeAllocSize(ty);
+        if (!attr.has(ParamAttrs::Align)) {
+          attr.set(ParamAttrs::Align);
+          attr.align = DL().getABITypeAlignment(ty);
+        }
       }
 
       if (i.paramHasAttr(argidx, llvm::Attribute::NoCapture))
@@ -323,6 +345,15 @@ public:
 
       if (i.paramHasAttr(argidx, llvm::Attribute::NonNull))
         attr.set(ParamAttrs::NonNull);
+
+      if (i.paramHasAttr(argidx, llvm::Attribute::NoUndef)) {
+        if (i.getArgOperand(argidx)->getType()->isAggregateType())
+          // TODO: noundef aggregate should be supported; it can have undef
+          // padding
+          return errorAttr(i.getAttribute(argidx, llvm::Attribute::NoUndef));
+
+        attr.set(ParamAttrs::NoUndef);
+      }
 
       if (i.paramHasAttr(argidx, llvm::Attribute::Returned)) {
         auto call2
@@ -343,6 +374,7 @@ public:
           ret_val = make_unique<ConversionOp>(*ty, value_name(i), *arg,
                                               ConversionOp::BitCast);
       }
+
       call->addArg(*arg, move(attr));
     }
     if (ret_val) {
@@ -669,8 +701,15 @@ end:
     case llvm::Intrinsic::uadd_sat:
     case llvm::Intrinsic::ssub_sat:
     case llvm::Intrinsic::usub_sat:
+    case llvm::Intrinsic::sshl_sat:
+    case llvm::Intrinsic::ushl_sat:
     case llvm::Intrinsic::cttz:
     case llvm::Intrinsic::ctlz:
+    case llvm::Intrinsic::umin:
+    case llvm::Intrinsic::umax:
+    case llvm::Intrinsic::smin:
+    case llvm::Intrinsic::smax:
+    case llvm::Intrinsic::abs:
     {
       PARSE_BINOP();
       BinOp::Op op;
@@ -685,9 +724,17 @@ end:
       case llvm::Intrinsic::uadd_sat: op = BinOp::UAdd_Sat; break;
       case llvm::Intrinsic::ssub_sat: op = BinOp::SSub_Sat; break;
       case llvm::Intrinsic::usub_sat: op = BinOp::USub_Sat; break;
+      case llvm::Intrinsic::sshl_sat: op = BinOp::SShl_Sat; break;
+      case llvm::Intrinsic::ushl_sat: op = BinOp::UShl_Sat; break;
       case llvm::Intrinsic::cttz:     op = BinOp::Cttz; break;
       case llvm::Intrinsic::ctlz:     op = BinOp::Ctlz; break;
-      default: UNREACHABLE();
+      case llvm::Intrinsic::umin:     op = BinOp::UMin; break;
+      case llvm::Intrinsic::umax:     op = BinOp::UMax; break;
+      case llvm::Intrinsic::smin:     op = BinOp::SMin; break;
+      case llvm::Intrinsic::smax:     op = BinOp::SMax; break;
+      case llvm::Intrinsic::abs:      op = BinOp::Abs; break;
+      default:
+        UNREACHABLE();
       }
       RETURN_IDENTIFIER(make_unique<BinOp>(*ty, value_name(i), *a, *b, op));
     }
@@ -764,16 +811,16 @@ end:
     case llvm::Intrinsic::lifetime_start:
     {
       PARSE_BINOP();
-      if (!llvm::isa<llvm::AllocaInst>(llvm::GetUnderlyingObject(
-          i.getOperand(1), DL())))
+      if (!llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(
+          i.getOperand(1))))
         return error(i);
       RETURN_IDENTIFIER(make_unique<StartLifetime>(*b));
     }
     case llvm::Intrinsic::lifetime_end:
     {
       PARSE_BINOP();
-      if (!llvm::isa<llvm::AllocaInst>(llvm::GetUnderlyingObject(
-          i.getOperand(1), DL())))
+      if (!llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(
+          i.getOperand(1))))
         return error(i);
       RETURN_IDENTIFIER(make_unique<Free>(*b, false));
     }
@@ -814,6 +861,10 @@ end:
 
   RetTy error(llvm::Instruction &i) {
     *out << "ERROR: Unsupported instruction: " << i << '\n';
+    return {};
+  }
+  RetTy errorAttr(const llvm::Attribute &attr) {
+    *out << "ERROR: Unsupported attribute: " << attr.getAsString() << '\n';
     return {};
   }
 
@@ -901,9 +952,16 @@ end:
         // they don't change
         continue;
 
-      case llvm::Attribute::ByVal:
+      case llvm::Attribute::ByVal: {
         attrs.set(ParamAttrs::ByVal);
+        auto ty = arg.getParamByValType();
+        attrs.blockSize = DL().getTypeAllocSize(ty);
+        if (!attrs.has(ParamAttrs::Align)) {
+          attrs.set(ParamAttrs::Align);
+          attrs.align = DL().getABITypeAlignment(ty);
+        }
         continue;
+      }
 
       case llvm::Attribute::NonNull:
         attrs.set(ParamAttrs::NonNull);
@@ -923,11 +981,15 @@ end:
 
       case llvm::Attribute::Dereferenceable:
         attrs.set(ParamAttrs::Dereferenceable);
-        attrs.setDerefBytes(attr.getDereferenceableBytes());
+        attrs.derefBytes = attr.getDereferenceableBytes();
+        continue;
+
+      case llvm::Attribute::NoUndef:
+        attrs.set(ParamAttrs::NoUndef);
         continue;
 
       default:
-        *out << "ERROR: Unsupported attribute: " << attr.getAsString() << '\n';
+        errorAttr(attr);
         return nullopt;
       }
     }
@@ -964,16 +1026,15 @@ end:
     }
 
     auto &attrs = Fn.getFnAttrs();
-    if (f.hasFnAttribute(llvm::Attribute::NoFree))
-      attrs.set(FnAttrs::NoFree);
-
     const auto &ridx = llvm::AttributeList::ReturnIndex;
+    parse_fnattrs(attrs, f.getReturnType(),
+                  [&](auto attr) { return f.hasFnAttribute(attr); },
+                  [&](auto attr) { return f.hasAttribute(ridx, attr); });
+
     if (uint64_t b = f.getDereferenceableBytes(ridx)) {
       attrs.set(FnAttrs::Dereferenceable);
       attrs.setDerefBytes(b);
     }
-    if (f.hasAttribute(ridx, llvm::Attribute::NonNull))
-      attrs.set(FnAttrs::NonNull);
 
     // create all BBs upfront in topological order
     vector<pair<BasicBlock*, llvm::BasicBlock*>> sorted_bbs;
