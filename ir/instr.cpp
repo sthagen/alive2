@@ -62,7 +62,7 @@ struct LoopLikeFunctionApproximator {
     prefix.add(ub_i);
 
     if (is_last) {
-      s.addPre(prefix().implies(!continue_i), true);
+      s.addPre(prefix().implies(!continue_i));
       return { move(res_i), move(np_i), move(ub) };
     }
 
@@ -90,8 +90,9 @@ uint64_t getGlobalVarSize(const IR::Value *V) {
 
 namespace IR {
 
-expr Instr::eqType(const Instr &i) const {
-  return getType() == i.getType();
+bool Instr::propagatesPoison() const {
+  // be on the safe side
+  return false;
 }
 
 expr Instr::getTypeConstraints() const {
@@ -184,6 +185,10 @@ vector<Value*> BinOp::operands() const {
   return { lhs, rhs };
 }
 
+bool BinOp::propagatesPoison() const {
+  return true;
+}
+
 void BinOp::rauw(const Value &what, Value &with) {
   RAUW(lhs);
   RAUW(rhs);
@@ -249,7 +254,7 @@ void BinOp::print(ostream &os) const {
 
 static void div_ub(State &s, const expr &a, const expr &b, const expr &ap,
                    const expr &bp, bool sign) {
-  s.addUB(bp);
+  // addUB(bp) is not needed because it is registered by getAndAddPoisonUB.
   s.addUB(b != 0);
   if (sign)
     s.addUB((ap && a != expr::IntSMin(b.bits())) || b != expr::mkInt(-1, b));
@@ -632,12 +637,12 @@ StateValue BinOp::toSMT(State &s) const {
   } else {
     scalar_op = [&](auto a, auto ap, auto b, auto bp) -> StateValue {
       auto [v, np] = fn(a, ap, b, bp);
-      return { move(v), ap && bp && np };
+      return { move(v), ap && (isDivOrRem() ? expr(true) : bp) && np };
     };
   }
 
   auto &a = s[*lhs];
-  auto &b = s[*rhs];
+  auto &b = isDivOrRem() ? s.getAndAddPoisonUB(*rhs) : s[*rhs];
 
   if (lhs->getType().isVectorType()) {
     auto retty = getType().getAsAggregateType();
@@ -680,7 +685,7 @@ StateValue BinOp::toSMT(State &s) const {
                                     bi->non_poison));
       }
     }
-    return retty->aggregateVals(vals, true);
+    return retty->aggregateVals(vals);
   }
 
   if (vertical_zip) {
@@ -688,7 +693,7 @@ StateValue BinOp::toSMT(State &s) const {
     auto [v1, v2] = zip_op(a.value, a.non_poison, b.value, b.non_poison);
     vals.emplace_back(move(v1));
     vals.emplace_back(move(v2));
-    return getType().getAsAggregateType()->aggregateVals(vals, true);
+    return getType().getAsAggregateType()->aggregateVals(vals);
   }
   return scalar_op(a.value, a.non_poison, b.value, b.non_poison);
 }
@@ -746,9 +751,25 @@ unique_ptr<Instr> BinOp::dup(const string &suffix) const {
                             fmath);
 }
 
+bool BinOp::isDivOrRem() const {
+  switch (op) {
+  case Op::SDiv:
+  case Op::SRem:
+  case Op::UDiv:
+  case Op::URem:
+    return true;
+  default:
+    return false;
+  }
+}
+
 
 vector<Value*> UnaryOp::operands() const {
   return { val };
+}
+
+bool UnaryOp::propagatesPoison() const {
+  return true;
 }
 
 void UnaryOp::rauw(const Value &what, Value &with) {
@@ -855,6 +876,10 @@ vector<Value*> UnaryReductionOp::operands() const {
   return { val };
 }
 
+bool UnaryReductionOp::propagatesPoison() const {
+  return true;
+}
+
 void UnaryReductionOp::rauw(const Value &what, Value &with) {
   RAUW(val);
 }
@@ -946,6 +971,10 @@ TernaryOp::TernaryOp(Type &type, string &&name, Value &a, Value &b, Value &c,
 
 vector<Value*> TernaryOp::operands() const {
   return { a, b, c };
+}
+
+bool TernaryOp::propagatesPoison() const {
+  return true;
 }
 
 void TernaryOp::rauw(const Value &what, Value &with) {
@@ -1040,6 +1069,10 @@ unique_ptr<Instr> TernaryOp::dup(const string &suffix) const {
 
 vector<Value*> ConversionOp::operands() const {
   return { val };
+}
+
+bool ConversionOp::propagatesPoison() const {
+  return true;
 }
 
 void ConversionOp::rauw(const Value &what, Value &with) {
@@ -1266,8 +1299,9 @@ StateValue Select::toSMT(State &s) const {
     auto cond_agg = cond->getType().getAsAggregateType();
 
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
-      vals.emplace_back(scalar(agg->extract(av, i), agg->extract(bv, i),
-                               cond_agg ? cond_agg->extract(cv, i) : cv));
+      if (!agg->isPadding(i))
+        vals.emplace_back(scalar(agg->extract(av, i), agg->extract(bv, i),
+                                 cond_agg ? cond_agg->extract(cv, i) : cv));
     }
     return agg->aggregateVals(vals);
   }
@@ -1377,6 +1411,9 @@ static StateValue update_repack(Type *type,
   indices.pop_back();
   vector<StateValue> vals;
   for (unsigned i = 0, e = ty->numElementsConst(); i < e; ++i) {
+    if (ty->isPadding(i))
+      continue;
+
     auto v = ty->extract(val, i);
     if (i == cur_idx) {
       vals.emplace_back(indices.empty() ?
@@ -1489,7 +1526,7 @@ static expr eq_except_padding(const Type &ty, const expr &e1, const expr &e2) {
 static expr not_poison_except_padding(const Type &ty, const expr &np) {
   const auto *aty = ty.getAsAggregateType();
   if (!aty) {
-    assert(np.isBool() && "non-aggregates should have boolean poison");
+    assert(!np.isValid() || np.isBool());
     return np;
   }
 
@@ -1506,23 +1543,32 @@ static expr not_poison_except_padding(const Type &ty, const expr &np) {
   return result;
 }
 
+static bool isUndefMask(const expr &e, const expr &var) {
+  auto ty_name = e.fn_name();
+  auto var_name = var.fn_name();
+  return string_view(ty_name).substr(0, 8) == "isundef_" &&
+         string_view(ty_name).substr(8, var_name.size()) == var_name;
+}
+
 static pair<expr,expr> // <extracted value, not_undef>
 strip_undef(State &s, const Value &val, const expr &e) {
   if (s.isUndef(e))
     return { expr::mkUInt(0, e), false };
 
-  expr c, a, b, lhs, rhs, ty;
-  unsigned h, l;
+  expr c, a, b, lhs, rhs;
 
-  // (ite (= ((_ extract 0 0) ty_%var) #b0) %var undef!0)
+  // two variants
+  // 1) boolean: (ite (= isundef_%var #b0) %var undef)
   if (e.isIf(c, a, b) && s.isUndef(b) && c.isEq(lhs, rhs)) {
     if (lhs.isZero())
       swap(lhs, rhs);
 
-    if (rhs.isZero() &&
-        lhs.isExtract(ty, h, l) && h == 0 && l == 0 && isTyVar(ty, a))
+    if (rhs.isZero() && isUndefMask(lhs, a))
       return { move(a), move(c) };
   }
+
+  // 2) (or (and |isundef_%var| undef) (and %var (not |isundef_%var|)))
+  // TODO
 
   return { e, eq_except_padding(val.getType(), e, s[val].value) };
 }
@@ -1593,7 +1639,7 @@ pack_return(State &s, Type &ty, vector<StateValue> &vals, const FnAttrs &attrs,
         continue;
       vs.emplace_back(pack_return(s, agg->getChild(i), vals, attrs, idx));
     }
-    return agg->aggregateVals(vs, true);
+    return agg->aggregateVals(vs);
   }
 
   auto &ret = vals[idx++];
@@ -1676,6 +1722,10 @@ expr ICmp::cond_var() const {
 
 vector<Value*> ICmp::operands() const {
   return { a, b };
+}
+
+bool ICmp::propagatesPoison() const {
+  return true;
 }
 
 void ICmp::rauw(const Value &what, Value &with) {
@@ -1908,6 +1958,8 @@ StateValue Freeze::toSMT(State &s) const {
     vector<StateValue> vals;
     auto ty = getType().getAsAggregateType();
     for (unsigned i = 0, e = ty->numElementsConst(); i != e; ++i) {
+      if (ty->isPadding(i))
+        continue;
       auto vi = ty->extract(v, i);
       vals.emplace_back(scalar(vi.value, vi.non_poison, ty->getChild(i)));
     }
@@ -2045,9 +2097,8 @@ void Branch::print(ostream &os) const {
 
 StateValue Branch::toSMT(State &s) const {
   if (cond) {
-    auto &c = s[*cond];
+    auto &c = s.getAndAddPoisonUB(*cond);
     auto [cond_val, not_undef] = strip_undef(s, *cond, c.value);
-    s.addUB(c.non_poison);
     s.addUB(move(not_undef));
     s.addCondJump(cond_val, dst_true, *dst_false);
   } else {
@@ -2099,11 +2150,10 @@ void Switch::print(ostream &os) const {
 }
 
 StateValue Switch::toSMT(State &s) const {
-  auto &val = s[*value];
+  auto &val = s.getAndAddPoisonUB(*value);
   expr default_cond(true);
 
   auto [cond_val, not_undef] = strip_undef(s, *value, val.value);
-  s.addUB(val.non_poison);
   s.addUB(move(not_undef));
 
   for (auto &[value_cond, bb] : targets) {
@@ -2370,6 +2420,8 @@ void Malloc::print(std::ostream &os) const {
 StateValue Malloc::toSMT(State &s) const {
   auto &m = s.getMemory();
   auto &[sz, np_size] = s.getAndAddUndefs(*size);
+  s.addUB(np_size);
+
   unsigned align = heap_block_alignment;
   expr nonnull = expr::mkBoolVar("malloc_never_fails");
   auto [p_new, allocated]
@@ -2392,7 +2444,7 @@ StateValue Malloc::toSMT(State &s) const {
     expr nullp = Pointer::mkNullPointer(m)();
     m.free(expr::mkIf(sz == 0 || allocated, p, nullp), false);
   }
-  return { move(p_new), expr(np_size) };
+  return { move(p_new), true };
 }
 
 expr Malloc::getTypeConstraints(const Function &f) const {
@@ -2445,9 +2497,11 @@ void Calloc::print(std::ostream &os) const {
 StateValue Calloc::toSMT(State &s) const {
   auto &[nm, np_num] = s.getAndAddUndefs(*num);
   auto &[sz, np_sz] = s.getAndAddUndefs(*size);
-  auto np = np_num && np_sz;
+  s.addUB(np_num);
+  s.addUB(np_sz);
 
   unsigned align = heap_block_alignment;
+  auto np = np_num && np_sz;
   expr size = nm * sz;
   expr nonnull = expr::mkBoolVar("malloc_never_fails");
   auto [p, allocated] = s.getMemory().alloc(size, align, Memory::MALLOC,
@@ -2457,7 +2511,7 @@ StateValue Calloc::toSMT(State &s) const {
 
   s.getMemory().memset(p, { expr::mkUInt(0, 8), true }, size, align, {}, false);
 
-  return { move(p), move(np) };
+  return { move(p), true };
 }
 
 expr Calloc::getTypeConstraints(const Function &f) const {
@@ -2491,8 +2545,7 @@ void StartLifetime::print(std::ostream &os) const {
 }
 
 StateValue StartLifetime::toSMT(State &s) const {
-  auto &[p, np] = s[*ptr];
-  s.addUB(np);
+  auto &p = s.getAndAddPoisonUB(*ptr).value;
   s.getMemory().startLifetime(p);
   return {};
 }
@@ -2524,8 +2577,7 @@ void Free::print(std::ostream &os) const {
 }
 
 StateValue Free::toSMT(State &s) const {
-  auto &[p, np] = s[*ptr];
-  s.addUB(np);
+  auto &p = s.getAndAddPoisonUB(*ptr).value;
   // If not heaponly, don't encode constraints
   s.getMemory().free(p, !heaponly);
 
@@ -2700,8 +2752,7 @@ void Load::print(std::ostream &os) const {
 }
 
 StateValue Load::toSMT(State &s) const {
-  auto &[p, np] = s[*ptr];
-  s.addUB(np);
+  auto &p = s.getAndAddPoisonUB(*ptr).value;
   auto [sv, ub] = s.getMemory().load(p, getType(), align);
   s.addUB(move(ub));
   return sv;
@@ -2742,8 +2793,7 @@ void Store::print(std::ostream &os) const {
 }
 
 StateValue Store::toSMT(State &s) const {
-  auto &[p, np] = s[*ptr];
-  s.addUB(np);
+  auto &p = s.getAndAddPoisonUB(*ptr).value;
   auto &v = s[*val];
   s.getMemory().store(p, v, val->getType(), align, s.getUndefVars());
   return {};
@@ -2845,9 +2895,8 @@ void Memcpy::print(ostream &os) const {
 StateValue Memcpy::toSMT(State &s) const {
   auto &[vdst, np_dst] = s[*dst];
   auto &[vsrc, np_src] = s[*src];
-  auto &[vbytes, np_bytes] = s[*bytes];
+  auto &vbytes = s.getAndAddPoisonUB(*bytes).value;
   s.addUB((vbytes != 0).implies(np_dst && np_src));
-  s.addUB(np_bytes);
 
   if (vbytes.bits() > bits_size_t)
     s.addUB(
@@ -2898,9 +2947,8 @@ void Memcmp::print(ostream &os) const {
 StateValue Memcmp::toSMT(State &s) const {
   auto &[vptr1, np1] = s[*ptr1];
   auto &[vptr2, np2] = s[*ptr2];
-  auto &[vnum, npn] = s[*num];
+  auto &vnum = s.getAndAddPoisonUB(*num).value;
   s.addUB((vnum != 0).implies(np1 && np2));
-  s.addUB(npn);
 
   Pointer p1(s.getMemory(), vptr1), p2(s.getMemory(), vptr2);
   // memcmp can be optimized to load & icmps, and it requires this
@@ -2993,8 +3041,7 @@ void Strlen::print(ostream &os) const {
 }
 
 StateValue Strlen::toSMT(State &s) const {
-  auto &[eptr, np_ptr] = s[*ptr];
-  s.addUB(np_ptr);
+  auto &eptr = s.getAndAddPoisonUB(*ptr).value;
 
   Pointer p(s.getMemory(), eptr);
   Type &ty = getType();

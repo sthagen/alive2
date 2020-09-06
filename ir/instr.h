@@ -19,8 +19,8 @@ protected:
 
 public:
   virtual std::vector<Value*> operands() const = 0;
+  virtual bool propagatesPoison() const;
   virtual void rauw(const Value &what, Value &with) = 0;
-  virtual smt::expr eqType(const Instr &i) const;
   smt::expr getTypeConstraints() const override;
   virtual smt::expr getTypeConstraints(const Function &f) const = 0;
   virtual std::unique_ptr<Instr> dup(const std::string &suffix) const = 0;
@@ -55,12 +55,14 @@ private:
   Op op;
   unsigned flags;
   FastMathFlags fmath;
+  bool isDivOrRem() const;
 
 public:
   BinOp(Type &type, std::string &&name, Value &lhs, Value &rhs, Op op,
         unsigned flags = 0, FastMathFlags fmath = {});
 
   std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -88,6 +90,7 @@ public:
   Op getOp() const { return op; }
   Value& getValue() const { return *val; }
   std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -112,6 +115,7 @@ public:
     : Instr(type, std::move(name)), val(&val), op(op) {}
 
   std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -134,6 +138,7 @@ public:
             FastMathFlags fmath = {});
 
   std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -158,6 +163,7 @@ public:
   Op getOp() const { return op; }
   Value& getValue() const { return *val; }
   std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;
@@ -259,6 +265,7 @@ public:
   ICmp(Type &type, std::string &&name, Cond cond, Value &a, Value &b);
 
   std::vector<Value*> operands() const override;
+  bool propagatesPoison() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
   StateValue toSMT(State &s) const override;

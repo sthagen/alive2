@@ -573,7 +573,8 @@ end:
           assert(!isa<llvm::ScalableVectorType>(opvty));
           vector<llvm::Constant *> offsets;
 
-          for (unsigned i = 0; i < opvty->getElementCount().Min; ++i) {
+          for (unsigned i = 0; i < opvty->getElementCount().getKnownMinValue();
+               ++i) {
             llvm::Constant *constofs = nullptr;
             if (auto cdv = dyn_cast<llvm::ConstantDataVector>(I.getOperand())) {
               constofs = cdv->getElementAsConstant(i);
@@ -1054,7 +1055,7 @@ end:
 
       for (auto &bb : f) {
         auto n = bb_num(&bb);
-        for (const auto &dst : llvm::successors(&bb)) {
+        for (auto *dst : llvm::successors(&bb)) {
           auto n_dst = bb_num(dst);
           edges[n].emplace(n_dst);
         }

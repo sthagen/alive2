@@ -47,14 +47,26 @@ private:
     smt::expr operator()() const;
   };
 
+  struct ValueAnalysis {
+    std::set<const Value *> non_poison_vals; // vars that are not poison
+
+    void intersect(const ValueAnalysis &other);
+    void reset();
+  };
+
+  struct BasicBlockInfo {
+    DomainPreds domain;
+    ValueAnalysis analysis;
+    smt::DisjointExpr<Memory> mem;
+  };
+
   // TODO: make this const again
   Function &f;
   bool source;
   bool disable_undef_rewrite = false;
   bool is_initialization_phase = true;
-  smt::AndExpr precondition, preconditionForApprox;
+  smt::AndExpr precondition;
   smt::AndExpr axioms;
-  smt::AndExpr ooms;
 
   const BasicBlock *current_bb = nullptr;
   std::set<smt::expr> quantified_vars;
@@ -63,11 +75,9 @@ private:
   std::unordered_map<const Value*, unsigned> values_map;
   std::vector<std::tuple<const Value*, ValTy, bool>> values;
 
-  // dst BB -> src BB -> (domain data, memory)
+  // dst BB -> src BB -> BasicBlockInfo
   std::unordered_map<const BasicBlock*,
-                     std::unordered_map<const BasicBlock*,
-                                        std::pair<DomainPreds,
-                                                  smt::DisjointExpr<Memory>>>>
+                     std::unordered_map<const BasicBlock*, BasicBlockInfo>>
     predecessor_data;
   std::unordered_set<const BasicBlock*> seen_bbs;
 
@@ -78,6 +88,7 @@ private:
   CurrentDomain domain;
   Memory memory;
   std::set<smt::expr> undef_vars;
+  ValueAnalysis analysis;
   std::array<StateValue, 64> tmp_values;
   unsigned i_tmp_values = 0; // next available position in tmp_values
 
@@ -117,6 +128,7 @@ public:
   const StateValue& exec(const Value &v);
   const StateValue& operator[](const Value &val);
   const StateValue& getAndAddUndefs(const Value &val);
+  const StateValue& getAndAddPoisonUB(const Value &val);
   const ValTy& at(const Value &val) const;
   const smt::OrExpr* jumpCondFrom(const BasicBlock &bb) const;
   bool isUndef(const smt::expr &e) const;
@@ -132,13 +144,11 @@ public:
 
   void addAxiom(smt::AndExpr &&ands) { axioms.add(std::move(ands)); }
   void addAxiom(smt::expr &&axiom) { axioms.add(std::move(axiom)); }
-  void addPre(smt::expr &&cond, bool forApprox = false)
-  { (forApprox ? preconditionForApprox : precondition).add(std::move(cond)); }
+  void addPre(smt::expr &&cond) { precondition.add(std::move(cond)); }
   void addUB(smt::expr &&ub);
   void addUB(const smt::expr &ub);
   void addUB(smt::AndExpr &&ubs);
   void addNoReturn();
-  void addOOM(smt::expr &&oom) { ooms.add(std::move(oom)); }
 
   std::vector<StateValue>
     addFnCall(const std::string &name, std::vector<StateValue> &&inputs,
@@ -159,10 +169,7 @@ public:
   auto& getFn() const { return f; }
   auto& getMemory() { return memory; }
   auto& getAxioms() const { return axioms; }
-  auto& getPre(bool forApprox = false) const
-  { return forApprox ? preconditionForApprox : precondition; }
-  auto& getPreForApprox() const { return preconditionForApprox; }
-  auto& getOOM() const { return ooms; }
+  auto& getPre() const { return precondition; }
   const auto& getValues() const { return values; }
   const auto& getQuantVars() const { return quantified_vars; }
 

@@ -238,12 +238,14 @@ static int cmpTypes(llvm::Type *TyL, llvm::Type *TyR,
   case llvm::Type::FixedVectorTyID: {
     auto *STyL = llvm::cast<llvm::VectorType>(TyL);
     auto *STyR = llvm::cast<llvm::VectorType>(TyR);
-    if (STyL->getElementCount().Scalable != STyR->getElementCount().Scalable)
-      return cmpNumbers(STyL->getElementCount().Scalable,
-                        STyR->getElementCount().Scalable);
-    if (STyL->getElementCount().Min != STyR->getElementCount().Min)
-      return cmpNumbers(STyL->getElementCount().Min,
-                        STyR->getElementCount().Min);
+    if (STyL->getElementCount().isScalable() !=
+        STyR->getElementCount().isScalable())
+      return cmpNumbers(STyL->getElementCount().isScalable(),
+                        STyR->getElementCount().isScalable());
+    if (STyL->getElementCount().getKnownMinValue() !=
+        STyR->getElementCount().getKnownMinValue())
+      return cmpNumbers(STyL->getElementCount().getKnownMinValue(),
+                        STyR->getElementCount().getKnownMinValue());
     return cmpTypes(STyL->getElementType(), STyR->getElementType(), FnL, FnR);
   }
   }
@@ -431,6 +433,7 @@ convenient way to demonstrate an existing optimizer bug.
   }
 
   auto &DL = M1.get()->getDataLayout();
+  auto targetTriple = llvm::Triple(M1.get()->getTargetTriple());
 
   llvm_util::initializer llvm_util_init(cerr, DL);
   smt_init.emplace();
@@ -442,12 +445,6 @@ convenient way to demonstrate an existing optimizer bug.
     auto SRC = findFunction(*M1, opt_src_fn);
     auto TGT = findFunction(*M1, opt_tgt_fn);
     if (SRC && TGT) {
-      auto &DL = M1.get()->getDataLayout();
-      auto targetTriple = llvm::Triple(M1.get()->getTargetTriple());
-
-      llvm_util::initializer llvm_util_init(cerr, DL);
-      smt_init.emplace();
-
       compareFunctions(*SRC, *TGT, targetTriple, goodCount, badCount,
                        errorCount);
       goto end;
@@ -471,7 +468,6 @@ convenient way to demonstrate an existing optimizer bug.
   {
   set<string> funcNames(opt_funcs.begin(), opt_funcs.end());
 
-  auto targetTriple = llvm::Triple(M1.get()->getTargetTriple());
   // FIXME: quadratic, may not be suitable for very large modules
   // emitted by opt-fuzz
   for (auto &F1 : *M1.get()) {

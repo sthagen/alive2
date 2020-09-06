@@ -1206,29 +1206,22 @@ expr expr::operator||(const expr &rhs) const {
   if (rhs.isTrue() || isFalse())
     return rhs;
 
+  expr n;
+  if ((isNot(n) && n.eq(rhs)) ||
+      (rhs.isNot(n) && eq(n)))
+    return true;
+
   C(rhs);
   Z3_ast args[] = { ast(), rhs() };
   return Z3_mk_or(ctx(), 2, args);
 }
 
 void expr::operator&=(const expr &rhs) {
-  if (!isValid() || eq(rhs) || isFalse() || rhs.isTrue()) {
-    // do nothing
-  } else if (!rhs.isValid() || rhs.isFalse() || isTrue()) {
-    *this = rhs;
-  } else {
-    *this = *this && rhs;
-  }
+  *this = *this && rhs;
 }
 
 void expr::operator|=(const expr &rhs) {
-  if (!isValid() || eq(rhs) || rhs.isFalse() || isTrue()) {
-    // do nothing
-  } else if (!rhs.isValid() || isFalse() || rhs.isTrue()) {
-    *this = rhs;
-  } else {
-    *this = *this || rhs;
-  }
+  *this = *this || rhs;
 }
 
 expr expr::mk_and(const set<expr> &vals) {
@@ -1282,6 +1275,14 @@ expr expr::uge(const expr &rhs) const {
 }
 
 expr expr::ugt(const expr &rhs) const {
+  C();
+  if (rhs.isAllOnes())
+    return false;
+
+  uint64_t n;
+  if (rhs.isUInt(n))
+    return uge(mkUInt(n + 1, sort()));
+
   return !ule(rhs);
 }
 
@@ -1657,6 +1658,9 @@ expr expr::simplify() const {
 
 expr expr::subst(const vector<pair<expr, expr>> &repls) const {
   C();
+  if (repls.empty())
+    return *this;
+
   unique_ptr<Z3_ast[]> from(new Z3_ast[repls.size()]);
   unique_ptr<Z3_ast[]> to(new Z3_ast[repls.size()]);
 
