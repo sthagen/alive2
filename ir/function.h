@@ -45,6 +45,7 @@ public:
   Instr& back() { return *m_instrs.back(); }
 
   bool empty() const { return m_instrs.empty(); }
+  JumpInstr::it_helper targets() const;
 
   std::unique_ptr<BasicBlock> dup(const std::string &suffix) const;
 
@@ -61,6 +62,8 @@ class Function final {
   unsigned bits_pointers = 64;
   unsigned bits_ptr_offset = 64;
   bool little_endian = true;
+  // If this is true, FnCalls having DependsOnFlag become valid unknown fn calls
+  bool fncall_valid_flag = true;
 
   // constants used in this function
   std::vector<std::unique_ptr<Value>> constants;
@@ -68,6 +71,9 @@ class Function final {
   std::vector<std::unique_ptr<Value>> undefs;
   std::vector<std::unique_ptr<AggregateValue>> aggregates;
   std::vector<std::unique_ptr<Value>> inputs;
+
+  // an input that has 'returned' attribute
+  Value *returned_input = nullptr;
 
   FnAttrs attrs;
 
@@ -84,6 +90,9 @@ public:
   const std::string& getName() const { return name; }
 
   auto& getFnAttrs() { return attrs; }
+
+  bool getFnCallValidFlag() const { return fncall_valid_flag; }
+  void setFnCallValidFlag(bool f) { fncall_valid_flag = f; }
 
   smt::expr getTypeConstraints() const;
   void fixupTypes(const smt::Model &m);
@@ -118,6 +127,9 @@ public:
   util::const_strip_unique_ptr<decltype(inputs)> getInputs() const {
     return inputs;
   }
+  bool hasSameInputs(const Function &rhs) const;
+  Value *getReturnedInput() const { return returned_input; }
+  void setReturnedInput(Value *v) { returned_input = v; }
 
   bool hasReturn() const;
   unsigned bitsPointers() const { return bits_pointers; }
@@ -155,6 +167,8 @@ public:
   std::multimap<Value*, Value*> getUsers() const;
   bool removeUnusedStuff(const std::multimap<Value*, Value*> &users,
                          const std::vector<std::string_view> &src_glbs);
+
+  void unroll(unsigned k);
 
   void print(std::ostream &os, bool print_header = true) const;
   friend std::ostream &operator<<(std::ostream &os, const Function &f);
@@ -210,6 +224,24 @@ class DomTree final {
     DomTree(Function &f, CFG &cfg) : f(f), cfg(cfg) { buildDominators(); }
     const BasicBlock* getIDominator(const BasicBlock &bb) const;
     void printDot(std::ostream &os) const;
+};
+
+class LoopAnalysis final {
+  Function &f;
+  CFG cfg;
+
+  std::map<const BasicBlock*, unsigned> number;
+  std::vector<const BasicBlock*> node;
+  std::vector<unsigned> last;
+  void getDepthFirstSpanningTree();
+
+  std::vector<unsigned> header;
+  enum NodeType { nonheader, self, reducible, irreducible };
+  std::vector<NodeType> type;
+  void analysis();
+public:
+  LoopAnalysis(Function &f) : f(f), cfg(f) { analysis(); }
+  void printDot(std::ostream &os) const;
 };
 
 }

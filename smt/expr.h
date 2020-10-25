@@ -64,7 +64,6 @@ class expr {
   static expr mkUInt(uint64_t n, Z3_sort sort);
   static expr mkInt(int64_t n, Z3_sort sort);
   static expr mkConst(Z3_func_decl decl);
-  static expr mkQuantVar(unsigned i, Z3_sort sort);
 
   bool isBinOp(expr &a, expr &b, int z3op) const;
 
@@ -101,6 +100,9 @@ public:
   static expr mkDoubleVar(const char *name);
   static expr mkFreshVar(const char *prefix, const expr &type);
 
+  // return a constant value of the given type
+  static expr some(const expr &type);
+
   static expr IntSMin(unsigned bits);
   static expr IntSMax(unsigned bits);
   static expr IntUMax(unsigned bits);
@@ -111,6 +113,7 @@ public:
   bool isValid() const { return ptr != 0; }
 
   bool isConst() const;
+  bool isVar() const;
   bool isBV() const;
   bool isBool() const;
   bool isTrue() const;
@@ -127,6 +130,8 @@ public:
   bool isInt(int64_t &n) const;
 
   bool isEq(expr &lhs, expr &rhs) const;
+  bool isSLE(expr &lhs, expr &rhs) const;
+  bool isULE(expr &lhs, expr &rhs) const;
   bool isIf(expr &cond, expr &then, expr &els) const;
   bool isConcat(expr &a, expr &b) const;
   bool isExtract(expr &e, unsigned &high, unsigned &low) const;
@@ -185,7 +190,7 @@ public:
   expr log2(unsigned bw_output) const;
   expr bswap() const;
   expr bitreverse() const;
-  expr cttz() const;
+  expr cttz(const expr &val_zero) const;
   expr ctlz() const;
   expr ctpop() const;
 
@@ -309,6 +314,9 @@ public:
   // replace v1 -> v2
   expr subst(const std::vector<std::pair<expr, expr>> &repls) const;
   expr subst(const expr &from, const expr &to) const;
+
+  // replace quantified variables in increasing index order
+  expr subst(const std::vector<expr> &repls) const;
 
   std::set<expr> vars() const;
   static std::set<expr> vars(const std::vector<const expr*> &exprs);

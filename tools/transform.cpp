@@ -109,6 +109,18 @@ static void error(Errors &errs, State &src_state, State &tgt_state,
 
   if (r.isInvalid()) {
     errs.add("Invalid expr", false);
+    auto &unsupported = src_state.getUnsupported();
+    if (!unsupported.empty()) {
+      string str = "The program uses the following unsupported features: ";
+      bool first = true;
+      for (auto name : unsupported) {
+        if (!first)
+          str += ", ";
+        str += name;
+        first = false;
+      }
+      errs.add(move(str), false);
+    }
     return;
   }
 
@@ -137,8 +149,7 @@ static void error(Errors &errs, State &src_state, State &tgt_state,
     s << " for " << *var;
   s << "\n\nExample:\n";
 
-  for (auto &[var, val, used] : src_state.getValues()) {
-    (void)used;
+  for (auto &[var, val] : src_state.getValues()) {
     if (!dynamic_cast<const Input*>(var) &&
         !dynamic_cast<const ConstantInput*>(var))
       continue;
@@ -157,8 +168,7 @@ static void error(Errors &errs, State &src_state, State &tgt_state,
       }
     }
 
-    for (auto &[var, val, used] : st->getValues()) {
-      (void)used;
+    for (auto &[var, val] : st->getValues()) {
       auto &name = var->getName();
       if (name == var_name)
         break;
@@ -273,6 +283,54 @@ static expr preprocess(Transform &t, const set<expr> &qvars0,
 }
 
 
+static expr
+encode_undef_refinement_per_elem(const Type &ty, const StateValue &sva,
+                                 expr &&a2, expr &&b, expr &&b2) {
+  const auto *aty = ty.getAsAggregateType();
+  if (!aty)
+    return sva.non_poison && sva.value == a2 && b != b2;
+
+  StateValue sva2{move(a2), expr()};
+  StateValue svb{move(b), expr()}, svb2{move(b2), expr()};
+  expr result = false;
+
+  for (unsigned i = 0; i < aty->numElementsConst(); ++i) {
+    if (!aty->isPadding(i))
+      result |= encode_undef_refinement_per_elem(aty->getChild(i),
+                  aty->extract(sva, i), aty->extract(sva2, i).value,
+                  aty->extract(svb, i).value, aty->extract(svb2, i).value);
+  }
+  return result;
+}
+
+// Returns negation of refinement
+static expr encode_undef_refinement(const Type &type, const State::ValTy &a,
+                                    const State::ValTy &b) {
+  // Undef refinement: (src-nonpoison /\ src-nonundef) -> tgt-nonundef
+  //
+  // Full refinement formula:
+  //   forall I .
+  //    (forall N . src_nonpoison(I, N) /\ retval_src(I, N) == retval_src(I, 0))
+  //      -> (forall N . retval_tgt(I, N) == retval_tgt(I, 0)
+
+  if (dynamic_cast<const VoidType *>(&type))
+    return false;
+  if (b.second.empty())
+    // target is never undef
+    return false;
+
+  auto subst = [](const auto &val) {
+    vector<pair<expr, expr>> repls;
+    for (auto &v : val.second) {
+      repls.emplace_back(v, expr::some(v));
+    }
+    return val.first.value.subst(repls);
+  };
+
+  return encode_undef_refinement_per_elem(type, a.first, subst(a),
+                                          expr(b.first.value), subst(b));
+}
+
 static void
 check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
                  const Value *var, const Type &type,
@@ -285,6 +343,8 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   auto &uvars = ap.second;
   auto qvars = src_state.getQuantVars();
   qvars.insert(ap.second.begin(), ap.second.end());
+  auto &fn_qvars = tgt_state.getFnQuantVars();
+  qvars.insert(fn_qvars.begin(), fn_qvars.end());
 
   auto err = [&](const Result &r, print_var_val_ty print, const char *msg) {
     error(errs, src_state, tgt_state, r, var, msg, check_each_var, print);
@@ -332,9 +392,11 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
       pre_src_forall = pre_src;
     }
   }
-  expr pre = pre_src_exists && pre_tgt;
+  expr pre = pre_src_exists && pre_tgt && src_state.getFnPre();
+  pre_src_forall &= tgt_state.getFnPre();
 
   auto [poison_cnstr, value_cnstr] = type.refines(src_state, tgt_state, a, b);
+  expr undef_cnstr = encode_undef_refinement(type, ap, bp);
 
   auto src_mem = src_state.returnMemory();
   auto tgt_mem = tgt_state.returnMemory();
@@ -399,6 +461,10 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
     { mk_fml(dom && !poison_cnstr),
       [&](const Result &r) {
         err(r, print_value, "Target is more poisonous than source");
+      }},
+    { mk_fml(dom && undef_cnstr),
+      [&](const Result &r) {
+        err(r, print_value, "Target's return value is more undefined");
       }},
     { mk_fml(dom && !value_cnstr),
       [&](const Result &r) {
@@ -579,6 +645,7 @@ static void calculateAndInitConstants(Transform &t) {
   does_ptr_store   = false;
   does_ptr_mem_access = false;
   does_int_mem_access = false;
+  bool does_any_byte_access = false;
 
   // Mininum access size (in bytes)
   uint64_t min_access_size = 8;
@@ -635,15 +702,14 @@ static void calculateAndInitConstants(Transform &t) {
 
         update_min_vect_sz(i.getType());
 
-        if (auto *fc = dynamic_cast<const FnCall*>(&i)) {
+        if (dynamic_cast<const FnCall*>(&i))
           has_fncall |= true;
-          has_free   |= !fc->getAttributes().has(FnAttrs::NoFree);
-        }
 
         if (auto *mi = dynamic_cast<const MemInstr *>(&i)) {
           max_alloc_size  = max(max_alloc_size, mi->getMaxAllocSize());
           max_access_size = max(max_access_size, mi->getMaxAccessSize());
           cur_max_gep     = add_saturate(cur_max_gep, mi->getMaxGEPOffset());
+          has_free       |= mi->canFree();
 
           auto info = mi->getByteAccessInfo();
           has_ptr_load         |= info.doesPtrLoad;
@@ -651,17 +717,16 @@ static void calculateAndInitConstants(Transform &t) {
           does_int_mem_access  |= info.hasIntByteAccess;
           does_mem_access      |= info.doesMemAccess();
           min_access_size       = gcd(min_access_size, info.byteSize);
+          if (info.doesMemAccess() && !info.hasIntByteAccess &&
+              !info.doesPtrLoad && !info.doesPtrStore)
+            does_any_byte_access = true;
 
           if (auto alloc = dynamic_cast<const Alloc*>(&i)) {
             has_alloca = true;
             has_dead_allocas |= alloc->initDead();
-          }
-          else if (auto alloc = dynamic_cast<const Malloc*>(&i)) {
-            has_malloc  = true;
-            has_free   |= alloc->isRealloc();
           } else {
-            has_malloc |= dynamic_cast<const Calloc*>(&i) != nullptr;
-            has_free   |= dynamic_cast<const Free*>(&i) != nullptr;
+            has_malloc |= dynamic_cast<const Malloc*>(&i) != nullptr ||
+                          dynamic_cast<const Calloc*>(&i) != nullptr;
           }
 
         } else if (isCast(ConversionOp::Int2Ptr, i) ||
@@ -680,6 +745,9 @@ static void calculateAndInitConstants(Transform &t) {
   }
 
   does_ptr_mem_access = has_ptr_load || does_ptr_store;
+  if (does_any_byte_access && !does_int_mem_access && !does_ptr_mem_access)
+    // Use int bytes only
+    does_int_mem_access = true;
 
   unsigned num_locals = max(num_locals_src, num_locals_tgt);
 
@@ -813,11 +881,31 @@ TransformVerify::TransformVerify(Transform &t, bool check_each_var) :
   }
 }
 
+pair<unique_ptr<State>, unique_ptr<State>> TransformVerify::exec() const {
+  StopWatch symexec_watch;
+  t.tgt.syncDataWithSrc(t.src);
+  calculateAndInitConstants(t);
+  State::resetGlobals();
+
+  auto src_state = make_unique<State>(t.src, true);
+  auto tgt_state = make_unique<State>(t.tgt, false);
+  sym_exec(*src_state);
+  tgt_state->syncSEdataWithSrc(*src_state);
+  sym_exec(*tgt_state);
+  src_state->mkAxioms(*tgt_state);
+
+  symexec_watch.stop();
+  if (symexec_watch.seconds() > 5) {
+    cerr << "WARNING: slow vcgen! Took " << symexec_watch << '\n';
+  }
+  return { move(src_state), move(tgt_state) };
+}
+
 Errors TransformVerify::verify() const {
-  try {
-    t.tgt.syncDataWithSrc(t.src);
-  } catch (AliveException &ae) {
-    return Errors(move(ae));
+  if (t.src.getFnAttrs() != t.tgt.getFnAttrs() ||
+      !t.src.hasSameInputs(t.tgt)) {
+    return { "Unsupported interprocedural transformation: signature mismatch "
+             "between src and tgt", false };
   }
 
   // Check sizes of global variables
@@ -833,68 +921,52 @@ Errors TransformVerify::verify() const {
     if (GVS->size() != GVT->size()) {
       stringstream ss;
       ss << "Unsupported interprocedural transformation: global variable "
-        << GVS->getName() << " has different size in source and target ("
-        << GVS->size() << " vs " << GVT->size()
-        << " bytes)";
+         << GVS->getName() << " has different size in source and target ("
+         << GVS->size() << " vs " << GVT->size()
+         << " bytes)";
       return { ss.str(), false };
     } else if (GVS->isConst() && !GVT->isConst()) {
       stringstream ss;
       ss << "Transformation is incorrect because global variable "
-        << GVS->getName() << " is const in source but not in target";
+         << GVS->getName() << " is const in source but not in target";
       return { ss.str(), true };
     } else if (!GVS->isConst() && GVT->isConst()) {
       stringstream ss;
       ss << "Unsupported interprocedural transformation: global variable "
-        << GVS->getName() << " is const in target but not in source";
+         << GVS->getName() << " is const in target but not in source";
       return { ss.str(), false };
     }
   }
 
-  StopWatch symexec_watch;
-  calculateAndInitConstants(t);
-  State::resetGlobals();
-  State src_state(t.src, true), tgt_state(t.tgt, false);
-
+  Errors errs;
   try {
-    sym_exec(src_state);
-    tgt_state.syncSEdataWithSrc(src_state);
-    sym_exec(tgt_state);
-    src_state.mkAxioms(tgt_state);
+    auto [src_state, tgt_state] = exec();
+
+    if (check_each_var) {
+      for (auto &[var, val] : src_state->getValues()) {
+        auto &name = var->getName();
+        if (name[0] != '%' || !dynamic_cast<const Instr*>(var))
+          continue;
+
+        // TODO: add data-flow domain tracking for Alive, but not for TV
+        check_refinement(errs, t, *src_state, *tgt_state, var, var->getType(),
+                         true, true, val,
+                         true, true, tgt_state->at(*tgt_instrs.at(name)),
+                         check_each_var);
+        if (errs)
+          return errs;
+      }
+    }
+
+    check_refinement(errs, t, *src_state, *tgt_state, nullptr, t.src.getType(),
+                     src_state->returnDomain()(), src_state->functionDomain()(),
+                     src_state->returnVal(),
+                     tgt_state->returnDomain()(), tgt_state->functionDomain()(),
+                     tgt_state->returnVal(),
+                     check_each_var);
   } catch (AliveException e) {
     return move(e);
   }
-
-  symexec_watch.stop();
-  if (symexec_watch.seconds() > 5) {
-    cerr << "WARNING: slow vcgen! Took " << symexec_watch << '\n';
-  }
-
-  Errors errs;
-
-  if (check_each_var) {
-    for (auto &[var, val, used] : src_state.getValues()) {
-      (void)used;
-      auto &name = var->getName();
-      if (name[0] != '%' || !dynamic_cast<const Instr*>(var))
-        continue;
-
-      // TODO: add data-flow domain tracking for Alive, but not for TV
-      check_refinement(errs, t, src_state, tgt_state, var, var->getType(),
-                       true, true, val,
-                       true, true, tgt_state.at(*tgt_instrs.at(name)),
-                       check_each_var);
-      if (errs)
-        return errs;
-    }
-  }
-
-  check_refinement(errs, t, src_state, tgt_state, nullptr, t.src.getType(),
-                   src_state.returnDomain()(), src_state.functionDomain()(),
-                   src_state.returnVal(),
-                   tgt_state.returnDomain()(), tgt_state.functionDomain()(),
-                   tgt_state.returnVal(),
-                   check_each_var);
-
   return errs;
 }
 
@@ -1033,7 +1105,7 @@ static void remove_unreachable_bbs(Function &f) {
   do {
     auto bb = wl.back();
     wl.pop_back();
-    if (!reachable.emplace(bb).second)
+    if (!reachable.emplace(bb).second || bb->empty())
       continue;
 
     if (auto instr = dynamic_cast<JumpInstr*>(&bb->back())) {
@@ -1077,6 +1149,13 @@ void Transform::preprocess() {
     src.getFirstBB().delInstr(isrc);
     tgt.getFirstBB().delInstr(Itgt->second);
     // TODO: check that tgt init refines that of src
+  }
+
+  // remove constants introduced in target
+  auto src_gvs = src.getGlobalVarNames();
+  for (auto &[name, itgt] : remove_init_tgt) {
+    if (find(src_gvs.begin(), src_gvs.end(), name.substr(1)) == src_gvs.end())
+      tgt.getFirstBB().delInstr(itgt);
   }
 
   // remove side-effect free instructions without users

@@ -2,6 +2,7 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include "ir/attrs.h"
+#include <cassert>
 
 using namespace std;
 
@@ -23,6 +24,8 @@ ostream& operator<<(ostream &os, const ParamAttrs &attr) {
     os << "noundef ";
   if (attr.has(ParamAttrs::Align))
     os << "align(" << attr.align << ") ";
+  if (attr.has(ParamAttrs::Returned))
+    os << "returned ";
   return os;
 }
 
@@ -49,4 +52,39 @@ ostream& operator<<(ostream &os, const FnAttrs &attr) {
   return os;
 }
 
+bool ParamAttrs::undefImpliesUB() const {
+  bool ub = has(NoUndef);
+  assert(!ub || poisonImpliesUB());
+  return ub;
+}
+
+bool ParamAttrs::operator==(const ParamAttrs &rhs) const {
+  if (bits != rhs.bits)
+    return false;
+
+  if (has(Dereferenceable) && derefBytes != rhs.derefBytes)
+    return false;
+  if (has(ByVal) && blockSize != rhs.blockSize)
+    return false;
+  if (has(Align) && align != rhs.align)
+    return false;
+
+  return true;
+}
+
+bool FnAttrs::undefImpliesUB() const {
+  bool ub = has(NoUndef);
+  assert(!ub || poisonImpliesUB());
+  return ub;
+}
+
+bool FnAttrs::operator==(const FnAttrs &rhs) const {
+  if (bits != rhs.bits)
+    return false;
+
+  if (has(Dereferenceable) && getDerefBytes() != rhs.getDerefBytes())
+    return false;
+
+  return true;
+}
 }

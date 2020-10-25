@@ -18,25 +18,20 @@
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
-
-#if (__GNUC__ < 8) && (!__APPLE__)
-# include <experimental/filesystem>
-  namespace fs = std::experimental::filesystem;
-#else
-# include <filesystem>
-  namespace fs = std::filesystem;
-#endif
 
 using namespace IR;
 using namespace llvm_util;
 using namespace tools;
 using namespace util;
 using namespace std;
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -48,6 +43,11 @@ llvm::cl::opt<unsigned> opt_smt_to(
   "tv-smt-to", llvm::cl::desc("Alive: timeout for SMT queries"),
   llvm::cl::init(1000), llvm::cl::value_desc("ms"));
 
+llvm::cl::opt<unsigned> opt_smt_random_seed(
+  "tv-smt-random-seed",
+  llvm::cl::desc("Alive: Random seed for the SMT solver (default=0)"),
+  llvm::cl::init(0));
+
 llvm::cl::opt<unsigned> opt_max_mem(
   "tv-max-mem", llvm::cl::desc("Alive: max memory (aprox)"),
   llvm::cl::init(1024), llvm::cl::value_desc("MB"));
@@ -58,6 +58,10 @@ llvm::cl::opt<bool> opt_se_verbose(
 
 llvm::cl::opt<bool> opt_smt_stats(
   "tv-smt-stats", llvm::cl::desc("Alive: show SMT statistics"),
+  llvm::cl::init(false));
+
+llvm::cl::opt<bool> opt_succinct(
+  "tv-succinct", llvm::cl::desc("Alive2: make the output succinct"),
   llvm::cl::init(false));
 
 llvm::cl::opt<bool> opt_alias_stats(
@@ -72,12 +76,21 @@ llvm::cl::opt<string> opt_report_dir(
   "tv-report-dir", llvm::cl::desc("Alive: save report to disk"),
   llvm::cl::value_desc("directory"));
 
+llvm::cl::opt<bool> opt_overwrite_reports(
+  "tv-overwrite-reports",
+  llvm::cl::desc("Alive: overwrite existing report files"),
+  llvm::cl::init(false));
+
 llvm::cl::opt<bool> opt_smt_verbose(
   "tv-smt-verbose", llvm::cl::desc("Alive: SMT verbose mode"),
   llvm::cl::init(false));
 
 llvm::cl::opt<bool> opt_tactic_verbose(
   "tv-tactic-verbose", llvm::cl::desc("Alive: SMT Tactic verbose mode"),
+  llvm::cl::init(false));
+
+llvm::cl::opt<bool> opt_smt_log(
+  "tv-smt-log", llvm::cl::desc("Alive: log interactions with the SMT solver"),
   llvm::cl::init(false));
 
 llvm::cl::opt<bool> opt_print_dot(
@@ -112,8 +125,15 @@ llvm::cl::opt<unsigned> opt_omit_array_size(
 
 llvm::cl::opt<bool> opt_io_nobuiltin(
     "tv-io-nobuiltin",
-    llvm::cl::desc("Encode standard I/O functions as an unknown function"),
+    llvm::cl::desc("Encode standard I/O functions as an unknown function "
+                   "(unused by clang plugin)"),
     llvm::cl::init(false));
+
+struct FnInfo {
+  Function fn;
+  unsigned order;
+  std::string fn_tostr;
+};
 
 ostream *out;
 ofstream out_file;
@@ -121,7 +141,7 @@ string report_filename;
 optional<smt::smt_initializer> smt_init;
 optional<llvm_util::initializer> llvm_util_init;
 TransformPrintOpts print_opts;
-unordered_map<string, pair<Function, unsigned>> fns;
+unordered_map<string, FnInfo> fns;
 set<string> fnsToVerify;
 unsigned initialized = 0;
 bool showed_stats = false;
@@ -132,6 +152,8 @@ bool is_clangtv = false;
 
 struct TVPass final : public llvm::FunctionPass {
   static char ID;
+  bool skip_verify = false;
+  bool encode_io_fns_as_unknown = false;
 
   TVPass() : FunctionPass(ID) {}
 
@@ -158,35 +180,58 @@ struct TVPass final : public llvm::FunctionPass {
 
     auto [I, first] = fns.try_emplace(F.getName().str());
     auto fn = llvm2alive(F, *TLI, first ? vector<string_view>()
-                                        : I->second.first.getGlobalVarNames());
+                                        : I->second.fn.getGlobalVarNames());
     if (!fn) {
       fns.erase(I);
       return false;
     }
 
-    auto old_fn = move(I->second.first);
-    I->second.first = move(*fn);
+    if (is_clangtv) {
+      // Compare Alive2 IR and skip if syntactically equal
+      stringstream ss;
+      fn->print(ss);
+
+      string str2 = ss.str();
+      // Optimization: since string comparison can be expensive for big
+      // functions, skip it if skip_verify is true.
+      // verifier.verify() will never happen if skip_verify is true, so
+      // there is nothing to prune early.
+      if (!skip_verify && I->second.fn_tostr == str2)
+        return false;
+
+      I->second.fn_tostr = move(str2);
+    }
+
+    auto old_fn = move(I->second.fn);
+    I->second.fn = move(*fn);
 
     if (opt_print_dot) {
-      auto &f = I->second.first;
-      ofstream file(f.getName() + '.' + to_string(I->second.second) + ".dot");
+      auto &f = I->second.fn;
+      ofstream file(f.getName() + '.' + to_string(I->second.order) + ".dot");
       CFG cfg(f);
       cfg.printDot(file);
-      ofstream fileDom(f.getName() + '.' + to_string(I->second.second++) +
+      ofstream fileDom(f.getName() + '.' + to_string(I->second.order++) +
                        ".dom.dot");
       DomTree(f, cfg).printDot(fileDom);
     }
 
-    if (first)
+    if (first || skip_verify)
       return false;
+
+    if (is_clangtv)
+      I->second.fn.setFnCallValidFlag(encode_io_fns_as_unknown);
 
     smt_init->reset();
     Transform t;
     t.src = move(old_fn);
-    t.tgt = move(I->second.first);
+    t.tgt = move(I->second.fn);
     t.preprocess();
     TransformVerify verifier(t, false);
-    t.print(*out, print_opts);
+    if (!opt_succinct)
+      t.print(*out, print_opts);
+
+    if (is_clangtv)
+      I->second.fn.setFnCallValidFlag(false);
 
     {
       auto types = verifier.getTypings();
@@ -207,7 +252,7 @@ struct TVPass final : public llvm::FunctionPass {
       *out << "Transformation seems to be correct!\n\n";
     }
 
-    I->second.first = move(t.tgt);
+    I->second.fn = move(t.tgt);
     return false;
   }
 
@@ -234,11 +279,13 @@ struct TVPass final : public llvm::FunctionPass {
       fname.replace_extension(".txt");
       fs::path path = fs::path(opt_report_dir.getValue()) / fname.filename();
 
-      do {
-        auto newname = fname.stem();
-        newname += "_" + to_string(rand(re)) + ".txt";
-        path.replace_filename(newname);
-      } while (fs::exists(path));
+      if (!opt_overwrite_reports) {
+        do {
+          auto newname = fname.stem();
+          newname += "_" + to_string(rand(re)) + ".txt";
+          path.replace_filename(newname);
+        } while (fs::exists(path));
+      }
 
       out_file = ofstream(path);
       out = &out_file;
@@ -250,16 +297,37 @@ struct TVPass final : public llvm::FunctionPass {
       report_filename = path;
       *out << "Source: " << source_file << endl;
       report_dir_created = true;
-    } else if (opt_report_dir.empty())
+
+      if (opt_smt_log) {
+        fs::path path_z3log = path;
+        path_z3log.replace_extension("z3_log.txt");
+        smt::start_logging(path_z3log.c_str());
+      }
+    } else if (opt_report_dir.empty()) {
       out = &cerr;
+      if (opt_smt_log) {
+        smt::start_logging();
+      }
+    }
 
     showed_stats = false;
     smt::solver_print_queries(opt_smt_verbose);
     smt::solver_tactic_verbose(opt_tactic_verbose);
     smt::set_query_timeout(to_string(opt_smt_to));
+    smt::set_random_seed(to_string(opt_smt_random_seed));
     smt::set_memory_limit(opt_max_mem * 1024 * 1024);
     config::skip_smt = opt_smt_skip;
-    config::io_nobuiltin = opt_io_nobuiltin;
+
+    if (!is_clangtv)
+      config::io_nobuiltin = opt_io_nobuiltin;
+    else {
+      config::io_nobuiltin = true;
+      if (opt_io_nobuiltin)
+        cerr << "Warning: -tv-io-nobuiltin isn't used by clang plugin. I/O"
+                " function calls will be always regarded as unknown fn calls"
+                " except InstCombine.\n";
+    }
+
     config::symexec_print_each_value = opt_se_verbose;
     config::disable_undef_input = opt_disable_undef_input;
     config::disable_poison_input = opt_disable_poison_input;
@@ -287,8 +355,13 @@ struct TVPass final : public llvm::FunctionPass {
     --initialized;
 
     if (has_failure) {
-      cerr << "Alive2: Transform doesn't verify; aborting!" << endl;
-      exit(1);
+      if (opt_error_fatal)
+        cerr << "Alive2: Transform doesn't verify; aborting!" << endl;
+      else
+        cerr << "Alive2: Transform doesn't verify!" << endl;
+
+      if (!is_clangtv)
+        exit(1);
     }
     return false;
   }
@@ -354,7 +427,13 @@ bool do_skip(const llvm::StringRef &ref) {
     "::TVInitPass", "::TVFinalizePass",
     "ArgumentPromotionPass", "DeadArgumentEliminationPass",
     "HotColdSplittingPass", "InlinerPass",
-    "GlobalOptPass", "IPSCCPPass"
+    "GlobalOptPass", "IPSCCPPass",
+    "ModuleInlinerWrapperPass", // inliner pass wrapper
+    "OpenMPOptPass", // open mp optimization (concurrency)
+    "PostOrderFunctionAttrsPass", // changes fn signatures
+    "InferFunctionAttrsPass", // changes fn signatures
+    "EntryExitInstrumenterPass", // instruments profiler-related fn calls
+    "EliminateAvailableExternallyPass", // Del. available_externally linkage fns
   };
   auto sref = ref.str();
   auto ends_with = [](const string_view &a, const string_view &suffix) {
@@ -392,16 +471,23 @@ llvmGetPassPluginInfo() {
           return;
         }
 
-        if (do_skip(P)) {
-          *out << "-- " << ++count << ". " << P.str() << " : Skipping\n";
-          return;
-        } else if (TVFinalizePass::finalized)
+        if (TVFinalizePass::finalized)
           return;
 
-        *out << "-- " << ++count << ". " << P.str() << "\n";
+        bool skip_pass = do_skip(P);
+        *out << "-- " << ++count << ". " << P.str()
+             << (skip_pass ? " : Skipping\n" : "\n");
+
         TVPass tv;
+        tv.skip_verify = skip_pass;
+        // For I/O known calls like printf, it is fine to regard them as valid
+        // 'unknown calls' except when it is InstCombine.
+        tv.encode_io_fns_as_unknown = P != "InstCombinePass" &&
+                                      P != "AggressiveInstCombinePass";
+
         auto M = const_cast<llvm::Module *>(unwrapModule(IR));
         for (auto &F: *M)
+          // If skip_pass is true, this updates fns map only.
           tv.runOnFunction(F);
       };
       PB.getPassInstrumentationCallbacks()->registerAfterPassCallback(move(f));

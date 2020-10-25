@@ -71,11 +71,22 @@ Please contact us or submit a PR if something is missing or inaccurate.
 22. Jumpthreading introduces jump on poison
 (https://bugs.llvm.org/show_bug.cgi?id=45956)
 
-23. Incorrect transformation> mul foo, undef -> shl foo, undef
+23. Incorrect transformation: mul foo, undef -> shl foo, undef
 (https://bugs.llvm.org/show_bug.cgi?id=47133)
 
+24. Incorrect transformation: (llvm.maximum undef, %x) -> undef
+(https://bugs.llvm.org/show_bug.cgi?id=47567)
 
-### Memory Operations (Load/Store/GEP/...)
+25. InstCombine: incorrect select operand simplification with undef
+(https://bugs.llvm.org/show_bug.cgi?id=47696)
+
+26. SCEVExpander introduces branch on poison
+(https://bugs.llvm.org/show_bug.cgi?id=47769)
+
+27. Incorrect transformation of fabs with nnan flag
+(https://bugs.llvm.org/show_bug.cgi?id=47960)
+
+### Memory Operations
 
 1. EmitGEPOffset() incorrectly adds NUW to multiplications
 (https://bugs.llvm.org/show_bug.cgi?id=42699)
@@ -132,6 +143,13 @@ NOTE: Alive2 can't find this bug anymore due to changes to reduce false-positive
 
 18. load-store-vectorizer cannot assume that an offset calculated from add nuw is fine in general
 (https://bugs.llvm.org/show_bug.cgi?id=46591)
+
+19. LoopReroll incorrectly reorders stores across loads when they may alias
+(https://bugs.llvm.org/show_bug.cgi?id=47658)
+
+20. MemCpyOpt: uses sext instead of zext for memcpy/memset size subtraction
+(https://bugs.llvm.org/show_bug.cgi?id=47697)
+
 
 ### Bugs found in Z3
 1. https://github.com/Z3Prover/z3/issues/2369 - bug in bitblast for FPA

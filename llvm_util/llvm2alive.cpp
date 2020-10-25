@@ -64,28 +64,6 @@ string_view s(llvm::StringRef str) {
   } while (0)
 
 
-FastMathFlags parse_fmath(llvm::Instruction &i) {
-  FastMathFlags fmath;
-  if (auto op = dyn_cast<llvm::FPMathOperator>(&i)) {
-    if (op->hasNoNaNs())
-      fmath.flags |= FastMathFlags::NNaN;
-    if (op->hasNoInfs())
-      fmath.flags |= FastMathFlags::NInf;
-    if (op->hasNoSignedZeros())
-      fmath.flags |= FastMathFlags::NSZ;
-    if (op->hasAllowReciprocal())
-      fmath.flags |= FastMathFlags::ARCP;
-    if (op->hasAllowContract())
-      fmath.flags |= FastMathFlags::Contract;
-    if (op->hasAllowReassoc())
-      fmath.flags |= FastMathFlags::Reassoc;
-    if (op->hasApproxFunc())
-      fmath.flags |= FastMathFlags::AFN;
-  }
-  return fmath;
-}
-
-
 template <typename Fn, typename RetFn>
 void parse_fnattrs(FnAttrs &attrs, llvm::Type *retTy, Fn &&hasAttr,
                    RetFn &&hasRetAttr) {
@@ -169,6 +147,13 @@ class llvm2alive_ : public llvm::InstVisitor<llvm2alive_, unique_ptr<Instr>> {
     return llvm_util::get_operand(v,
         [this](auto I) { return convert_constexpr(I); },
         [&](auto ag) { return copy_inserter(ag); });
+  }
+
+  RetTy NOP(llvm::Instruction &i) {
+    // some NOP instruction
+    assert(i.getType()->isVoidTy());
+    auto true_val = get_operand(llvm::ConstantInt::getTrue(i.getContext()));
+    return make_unique<Assume>(*true_val, Assume::AndNonPoison);
   }
 
 public:
@@ -268,7 +253,7 @@ public:
       args.emplace_back(a);
     }
 
-    auto [call_val, known] = known_call(i, TLI, *BB, args);
+    auto [call_val, known_kind] = known_call(i, TLI, *BB, args);
     if (call_val)
       RETURN_IDENTIFIER(move(call_val));
 
@@ -280,6 +265,9 @@ public:
     auto ty = llvm_type2alive(i.getType());
     if (!ty)
       return error(i);
+
+    if (fn->getName().substr(0, 15) == "__llvm_profile_")
+      return NOP(i);
 
     FnAttrs attrs;
     parse_fnattrs(attrs, i.getType(),
@@ -299,13 +287,19 @@ public:
     }
 
     string fn_name = '@' + fn->getName().str();
+    FnCall::ValidKind valid = FnCall::Invalid;
+    if (known_kind == FnUnknown)
+      valid = FnCall::Valid;
+    else if (known_kind == FnDependsOnOpt)
+      valid = FnCall::DependsOnFlag;
+
     auto call =
       make_unique<FnCall>(*ty, value_name(i), move(fn_name), move(attrs),
-                          !known);
+                          valid);
     unique_ptr<Instr> ret_val;
 
     // avoid parsing arguments altogether for "unknown known" functions
-    if (known)
+    if (known_kind == FnKnown)
       goto end;
 
     for (uint64_t argidx = 0, nargs = i.arg_size(); argidx < nargs; ++argidx) {
@@ -358,7 +352,7 @@ public:
       if (i.paramHasAttr(argidx, llvm::Attribute::Returned)) {
         auto call2
           = make_unique<FnCall>(Type::voidTy, "", string(call->getFnName()),
-                                FnAttrs(call->getAttributes()), !known);
+                                FnAttrs(call->getAttributes()), valid);
         for (auto &[arg, flags] : call->getArgs()) {
           call2->addArg(*arg, ParamAttrs(flags));
         }
@@ -682,15 +676,31 @@ end:
 
   RetTy visitUnreachableInst(llvm::UnreachableInst &i) {
     auto fals = get_operand(llvm::ConstantInt::getFalse(i.getContext()));
-    return make_unique<Assume>(*fals, /*if_non_poison=*/false);
+    return make_unique<Assume>(*fals, Assume::AndNonPoison);
   }
 
   RetTy visitIntrinsicInst(llvm::IntrinsicInst &i) {
     switch (i.getIntrinsicID()) {
     case llvm::Intrinsic::assume:
     {
+      unsigned n = i.getNumOperandBundles();
+      for (unsigned j = 0; j < n; ++j) {
+        auto bundle = i.getOperandBundleAt(j);
+        llvm::StringRef name = bundle.getTagName();
+        if (name == "noundef") {
+          // Currently it is unclear whether noundef bundle takes single op.
+          // Be conservative & simply assume it can take arbitrary num of ops.
+          for (unsigned j = 0; j < bundle.Inputs.size(); ++j) {
+            llvm::Value *v = bundle.Inputs[j].get();
+            BB->addInstr(
+              make_unique<Assume>(*get_operand(v), Assume::WellDefined));
+          }
+        } else {
+          return error(i);
+        }
+      }
       PARSE_UNOP();
-      return make_unique<Assume>(*val, false);
+      return make_unique<Assume>(*val, Assume::AndNonPoison);
     }
     case llvm::Intrinsic::sadd_with_overflow:
     case llvm::Intrinsic::uadd_with_overflow:
@@ -743,7 +753,8 @@ end:
     case llvm::Intrinsic::bswap:
     case llvm::Intrinsic::ctpop:
     case llvm::Intrinsic::expect:
-    case llvm::Intrinsic::is_constant: {
+    case llvm::Intrinsic::is_constant:
+    case llvm::Intrinsic::fabs: {
       PARSE_UNOP();
       UnaryOp::Op op;
       switch (i.getIntrinsicID()) {
@@ -752,31 +763,33 @@ end:
       case llvm::Intrinsic::ctpop:      op = UnaryOp::Ctpop; break;
       case llvm::Intrinsic::expect:     op = UnaryOp::Copy; break;
       case llvm::Intrinsic::is_constant: op = UnaryOp::IsConstant; break;
+      case llvm::Intrinsic::fabs:        op = UnaryOp::FAbs; break;
       default: UNREACHABLE();
       }
-      RETURN_IDENTIFIER(make_unique<UnaryOp>(*ty, value_name(i), *val, op));
+      RETURN_IDENTIFIER(make_unique<UnaryOp>(*ty, value_name(i), *val, op,
+                                             parse_fmath(i)));
     }
-    case llvm::Intrinsic::experimental_vector_reduce_add:
-    case llvm::Intrinsic::experimental_vector_reduce_mul:
-    case llvm::Intrinsic::experimental_vector_reduce_and:
-    case llvm::Intrinsic::experimental_vector_reduce_or:
-    case llvm::Intrinsic::experimental_vector_reduce_xor:
-    case llvm::Intrinsic::experimental_vector_reduce_smax:
-    case llvm::Intrinsic::experimental_vector_reduce_smin:
-    case llvm::Intrinsic::experimental_vector_reduce_umax:
-    case llvm::Intrinsic::experimental_vector_reduce_umin: {
+    case llvm::Intrinsic::vector_reduce_add:
+    case llvm::Intrinsic::vector_reduce_mul:
+    case llvm::Intrinsic::vector_reduce_and:
+    case llvm::Intrinsic::vector_reduce_or:
+    case llvm::Intrinsic::vector_reduce_xor:
+    case llvm::Intrinsic::vector_reduce_smax:
+    case llvm::Intrinsic::vector_reduce_smin:
+    case llvm::Intrinsic::vector_reduce_umax:
+    case llvm::Intrinsic::vector_reduce_umin: {
       PARSE_UNOP();
       UnaryReductionOp::Op op;
       switch (i.getIntrinsicID()) {
-      case llvm::Intrinsic::experimental_vector_reduce_add: op = UnaryReductionOp::Add; break;
-      case llvm::Intrinsic::experimental_vector_reduce_mul: op = UnaryReductionOp::Mul; break;
-      case llvm::Intrinsic::experimental_vector_reduce_and: op = UnaryReductionOp::And; break;
-      case llvm::Intrinsic::experimental_vector_reduce_or:  op = UnaryReductionOp::Or;  break;
-      case llvm::Intrinsic::experimental_vector_reduce_xor: op = UnaryReductionOp::Xor; break;
-      case llvm::Intrinsic::experimental_vector_reduce_smax: op = UnaryReductionOp::SMax; break;
-      case llvm::Intrinsic::experimental_vector_reduce_smin: op = UnaryReductionOp::SMin; break;
-      case llvm::Intrinsic::experimental_vector_reduce_umax: op = UnaryReductionOp::UMax; break;
-      case llvm::Intrinsic::experimental_vector_reduce_umin: op = UnaryReductionOp::UMin; break;
+      case llvm::Intrinsic::vector_reduce_add: op = UnaryReductionOp::Add; break;
+      case llvm::Intrinsic::vector_reduce_mul: op = UnaryReductionOp::Mul; break;
+      case llvm::Intrinsic::vector_reduce_and: op = UnaryReductionOp::And; break;
+      case llvm::Intrinsic::vector_reduce_or:  op = UnaryReductionOp::Or;  break;
+      case llvm::Intrinsic::vector_reduce_xor: op = UnaryReductionOp::Xor; break;
+      case llvm::Intrinsic::vector_reduce_smax: op = UnaryReductionOp::SMax; break;
+      case llvm::Intrinsic::vector_reduce_smin: op = UnaryReductionOp::SMin; break;
+      case llvm::Intrinsic::vector_reduce_umax: op = UnaryReductionOp::UMax; break;
+      case llvm::Intrinsic::vector_reduce_umin: op = UnaryReductionOp::UMin; break;
       default: UNREACHABLE();
       }
       RETURN_IDENTIFIER(make_unique<UnaryReductionOp>(*ty, value_name(i), *val, op));
@@ -798,12 +811,16 @@ end:
     }
     case llvm::Intrinsic::minnum:
     case llvm::Intrinsic::maxnum:
+    case llvm::Intrinsic::minimum:
+    case llvm::Intrinsic::maximum:
     {
       PARSE_BINOP();
       BinOp::Op op;
       switch (i.getIntrinsicID()) {
       case llvm::Intrinsic::minnum:   op = BinOp::FMin; break;
       case llvm::Intrinsic::maxnum:   op = BinOp::FMax; break;
+      case llvm::Intrinsic::minimum:  op = BinOp::FMinimum; break;
+      case llvm::Intrinsic::maximum:  op = BinOp::FMaximum; break;
       default: UNREACHABLE();
       }
       RETURN_IDENTIFIER(make_unique<BinOp>(*ty, value_name(i), *a, *b,
@@ -828,8 +845,14 @@ end:
 
     // do nothing intrinsics
     case llvm::Intrinsic::dbg_addr:
+    case llvm::Intrinsic::dbg_declare:
+    case llvm::Intrinsic::dbg_label:
+    case llvm::Intrinsic::dbg_value:
     case llvm::Intrinsic::donothing:
-      return {};
+    case llvm::Intrinsic::instrprof_increment:
+    case llvm::Intrinsic::instrprof_increment_step:
+    case llvm::Intrinsic::instrprof_value_profile:
+      return NOP(i);
 
     default:
       break;
@@ -857,7 +880,6 @@ end:
                                                  move(mask)));
   }
 
-  RetTy visitDbgInfoIntrinsic(llvm::DbgInfoIntrinsic&) { return {}; }
   RetTy visitInstruction(llvm::Instruction &i) { return error(i); }
 
   RetTy error(llvm::Instruction &i) {
@@ -918,7 +940,7 @@ end:
         }
 
         if (range)
-          BB->addInstr(make_unique<Assume>(*range, true));
+          BB->addInstr(make_unique<Assume>(*range, Assume::IfNonPoison));
         break;
       }
 
@@ -989,6 +1011,10 @@ end:
         attrs.set(ParamAttrs::NoUndef);
         continue;
 
+      case llvm::Attribute::Returned:
+        attrs.set(ParamAttrs::Returned);
+        continue;
+
       default:
         errorAttr(attr);
         return nullopt;
@@ -1023,6 +1049,12 @@ end:
         return {};
       auto val = make_unique<Input>(*ty, value_name(arg), move(*attrs));
       add_identifier(arg, *val.get());
+
+      if (arg.hasReturnedAttr()) {
+        // Cache this to avoid linear lookup at return
+        assert(Fn.getReturnedInput() == nullptr);
+        Fn.setReturnedInput(val.get());
+      }
       Fn.addInput(move(val));
     }
 

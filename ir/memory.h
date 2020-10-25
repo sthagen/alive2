@@ -318,11 +318,14 @@ public:
   class CallState {
     std::vector<smt::expr> non_local_block_val;
     smt::expr non_local_block_liveness;
-    smt::expr liveness_var;
     bool empty = true;
 
   public:
-    smt::expr implies(const CallState &st) const;
+    static CallState mkIf(const smt::expr &cond, const CallState &then,
+                          const CallState &els);
+    smt::expr operator==(const CallState &rhs) const;
+    // for container use only
+    bool operator<(const CallState &rhs) const;
     friend class Memory;
   };
 
@@ -344,6 +347,7 @@ public:
 
     PtrInput(StateValue &&v, bool byval, bool nocapture) :
       val(std::move(v)), byval(byval), nocapture(nocapture) {}
+    smt::expr operator==(const PtrInput &rhs) const;
     bool operator<(const PtrInput &rhs) const {
       return std::tie(val, byval, nocapture) <
              std::tie(rhs.val, rhs.byval, rhs.nocapture);
@@ -411,6 +415,7 @@ public:
 
   // for container use only
   bool operator<(const Memory &rhs) const;
+  bool cmpFnCallInput(const Memory &rhs) const;
 
   static void printAliasStats(std::ostream &os) {
     AliasSet::printStats(os);

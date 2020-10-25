@@ -4,8 +4,10 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include "ir/function.h"
+#include "ir/state.h"
 #include "smt/solver.h"
 #include "util/errors.h"
+#include <memory>
 #include <string>
 #include <ostream>
 #include <unordered_map>
@@ -52,6 +54,7 @@ class TransformVerify {
 
 public:
   TransformVerify(Transform &t, bool check_each_var);
+  std::pair<std::unique_ptr<IR::State>,std::unique_ptr<IR::State>> exec() const;
   util::Errors verify() const;
   TypingAssignments getTypings() const;
   void fixupTypes(const TypingAssignments &ty);

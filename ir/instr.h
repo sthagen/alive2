@@ -46,7 +46,7 @@ public:
             SAdd_Sat, UAdd_Sat, SSub_Sat, USub_Sat, SShl_Sat, UShl_Sat,
             SAdd_Overflow, UAdd_Overflow, SSub_Overflow, USub_Overflow,
             SMul_Overflow, UMul_Overflow,
-            FAdd, FSub, FMul, FDiv, FRem, FMax, FMin,
+            FAdd, FSub, FMul, FDiv, FRem, FMax, FMin, FMaximum, FMinimum,
             And, Or, Xor, Cttz, Ctlz, UMin, UMax, SMin, SMax, Abs };
   enum Flags { None = 0, NSW = 1 << 0, NUW = 1 << 1, Exact = 1 << 2 };
 
@@ -74,7 +74,7 @@ public:
 class UnaryOp final : public Instr {
 public:
   enum Op {
-    Copy, BitReverse, BSwap, Ctpop, IsConstant, FNeg
+    Copy, BitReverse, BSwap, Ctpop, IsConstant, FNeg, FFS, FAbs
   };
 
 private:
@@ -224,32 +224,6 @@ public:
 };
 
 
-class FnCall final : public Instr {
-private:
-  std::string fnName;
-  std::vector<std::pair<Value*, ParamAttrs>> args;
-  FnAttrs attrs;
-  bool valid;
-public:
-  FnCall(Type &type, std::string &&name, std::string &&fnName,
-         FnAttrs &&attrs = FnAttrs::None, bool valid = true)
-    : Instr(type, std::move(name)), fnName(std::move(fnName)),
-      attrs(std::move(attrs)), valid(valid) {}
-  void addArg(Value &arg, ParamAttrs &&attrs);
-  const auto& getFnName() const { return fnName; }
-  const auto& getArgs() const { return args; }
-  const auto& getAttributes() const { return attrs; }
-
-  bool hasAttribute(const FnAttrs::Attribute &i) const { return attrs.has(i); }
-  std::vector<Value*> operands() const override;
-  void rauw(const Value &what, Value &with) override;
-  void print(std::ostream &os) const override;
-  StateValue toSMT(State &s) const override;
-  smt::expr getTypeConstraints(const Function &f) const override;
-  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
-};
-
-
 class ICmp final : public Instr {
 public:
   enum Cond { EQ, NE, SLE, SLT, SGE, SGT, ULE, ULT, UGE, UGT, Any };
@@ -349,7 +323,7 @@ public:
   class it_helper {
     JumpInstr *instr;
   public:
-    it_helper(JumpInstr *instr) : instr(instr) {}
+    it_helper(JumpInstr *instr = nullptr) : instr(instr) {}
     target_iterator begin() const { return { instr, 0 }; }
     target_iterator end() const;
   };
@@ -418,12 +392,20 @@ public:
 
 
 class Assume final : public Instr {
-  Value *cond;
-  bool if_non_poison; /// cond only needs to hold if non-poison
 public:
-  Assume(Value &cond, bool if_non_poison)
-    : Instr(Type::voidTy, "assume"), cond(&cond),
-      if_non_poison(if_non_poison) {}
+  enum Kind {
+    AndNonPoison, /// cond should be non-poison and hold
+    IfNonPoison, /// cond only needs to hold if non-poison
+    WellDefined /// cond only needs to be well defined (can be false)
+  };
+
+private:
+  Value *cond;
+  Kind kind;
+
+public:
+  Assume(Value &cond, Kind kind)
+    : Instr(Type::voidTy, "assume"), cond(&cond), kind(kind) {}
 
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
@@ -452,6 +434,9 @@ public:
   // already contains the offset.
   virtual uint64_t getMaxGEPOffset() const = 0;
 
+  // Can this instruction free allocated objects?
+  virtual bool canFree() const = 0;
+
   struct ByteAccessInfo {
     bool hasIntByteAccess = false;
     bool doesPtrLoad = false;
@@ -465,6 +450,7 @@ public:
     bool doesMemAccess() const { return byteSize; }
 
     static ByteAccessInfo intOnly(unsigned byteSize);
+    static ByteAccessInfo anyType(unsigned byteSize);
     static ByteAccessInfo get(const Type &t, bool store, unsigned align);
     static ByteAccessInfo full(unsigned byteSize);
   };
@@ -490,6 +476,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -520,6 +507,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -543,6 +531,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -563,6 +552,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -584,6 +574,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -610,6 +601,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -634,6 +626,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -660,6 +653,7 @@ public:
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxAccessStride() const;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -685,6 +679,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -713,6 +708,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -737,6 +733,7 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;
@@ -759,6 +756,45 @@ public:
   uint64_t getMaxAllocSize() const override;
   uint64_t getMaxAccessSize() const override;
   uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
+  ByteAccessInfo getByteAccessInfo() const override;
+
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
+class FnCall final : public MemInstr {
+public:
+  enum ValidKind {
+    Invalid, Valid,
+    // This fn call is valid iff Function::fncall_valid_flag is true
+    DependsOnFlag
+  };
+private:
+  std::string fnName;
+  std::vector<std::pair<Value*, ParamAttrs>> args;
+  FnAttrs attrs;
+  ValidKind valid;
+public:
+  FnCall(Type &type, std::string &&name, std::string &&fnName,
+         FnAttrs &&attrs = FnAttrs::None, ValidKind valid = Valid)
+    : MemInstr(type, std::move(name)), fnName(std::move(fnName)),
+      attrs(std::move(attrs)), valid(valid) {}
+  void addArg(Value &arg, ParamAttrs &&attrs);
+  const auto& getFnName() const { return fnName; }
+  const auto& getArgs() const { return args; }
+  const auto& getAttributes() const { return attrs; }
+  bool hasAttribute(const FnAttrs::Attribute &i) const { return attrs.has(i); }
+
+  uint64_t getMaxAllocSize() const override;
+  uint64_t getMaxAccessSize() const override;
+  uint64_t getMaxGEPOffset() const override;
+  bool canFree() const override;
   ByteAccessInfo getByteAccessInfo() const override;
 
   std::vector<Value*> operands() const override;

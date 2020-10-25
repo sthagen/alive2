@@ -4,6 +4,8 @@
 #include "ir/function.h"
 #include "ir/instr.h"
 #include "util/errors.h"
+#include "util/unionfind.h"
+#include <fstream>
 
 using namespace smt;
 using namespace util;
@@ -36,6 +38,14 @@ void BasicBlock::delInstr(Instr *i) {
       return;
     }
   }
+}
+
+JumpInstr::it_helper BasicBlock::targets() const {
+  if (empty())
+    return {};
+  if (auto jump = dynamic_cast<JumpInstr*>(m_instrs.back().get()))
+    return jump->targets();
+  return {};
 }
 
 unique_ptr<BasicBlock> BasicBlock::dup(const string &suffix) const {
@@ -152,6 +162,36 @@ void Function::addInput(unique_ptr<Value> &&i) {
   inputs.emplace_back(move(i));
 }
 
+bool Function::hasSameInputs(const Function &rhs) const {
+  auto litr = inputs.begin(), lend = inputs.end();
+  auto ritr = rhs.inputs.begin(), rend = rhs.inputs.end();
+
+  auto skip_constinputs = [&]() {
+    while (litr != lend && dynamic_cast<ConstantInput *>((*litr).get()))
+      litr++;
+    while (ritr != rend && dynamic_cast<ConstantInput *>((*ritr).get()))
+      ritr++;
+  };
+
+  skip_constinputs();
+
+  while (litr != lend && ritr != rend) {
+    auto *lv = dynamic_cast<Input *>((*litr).get());
+    auto *rv = dynamic_cast<Input *>((*ritr).get());
+    // TODO: &lv->getType() != &rv->getType() doesn't work because
+    // two struct types that are structurally equivalent don't compare equal
+    if (lv->getAttributes() != rv->getAttributes()) {
+      return false;
+    }
+
+    litr++;
+    ritr++;
+    skip_constinputs();
+  }
+
+  return litr == lend && ritr == rend;
+}
+
 bool Function::hasReturn() const {
   for (auto &i : instrs()) {
     if (dynamic_cast<const Return *>(&i))
@@ -251,6 +291,14 @@ bool Function::removeUnusedStuff(const multimap<Value*, Value*> &users,
   bool changed = removeUnused(aggregates, users, src_glbs);
   changed |= removeUnused(constants, users, src_glbs);
   return changed;
+}
+
+void Function::unroll(unsigned k) {
+  if (k == 0)
+    return;
+  LoopAnalysis la(*this);
+  ofstream out("a.gv");
+  la.printDot(out);
 }
 
 void Function::print(ostream &os, bool print_header) const {
@@ -425,6 +473,115 @@ void DomTree::printDot(std::ostream &os) const {
     }
   }
 
+  os << "}\n";
+}
+
+
+void LoopAnalysis::getDepthFirstSpanningTree() {
+  unsigned bb_count = f.getBBs().size();
+  node.resize(bb_count, nullptr);
+  last.resize(bb_count, -1u);
+
+  unsigned current = 0;
+  vector<pair<const BasicBlock*, bool>> worklist = { {&f.getFirstBB(), false} };
+  while(!worklist.empty()) {
+    auto &[bb, flag] = worklist.back();
+    if (flag) {
+      worklist.pop_back();
+      last[number[bb]] = current - 1;
+    } else {
+      node[current] = bb;
+      number[bb] = current++;
+      flag = true;
+
+      for (auto &tgt : bb->targets())
+        if (!number.count(&tgt))
+          worklist.emplace_back(&tgt, false);
+    }
+  }
+}
+
+// Implemention of Tarjan-Havlak algorithm.
+//
+// Irreducible loops are partially supported.
+//
+// Tarjan, R. (1974). Testing Flow Graph Reducibility.
+// Havlak, P. (1997). Nesting of reducible and irreducible loops.
+void LoopAnalysis::analysis() {
+  getDepthFirstSpanningTree();
+  unsigned bb_count = f.getBBs().size();
+
+  auto isAncestor = [this](unsigned w, unsigned v) -> bool {
+    return w <= v && v <= last[w];
+  };
+
+  vector<set<unsigned>> nonBackPreds(bb_count), backPreds(bb_count);
+  header.resize(bb_count, 0);
+  type.resize(bb_count, NodeType::nonheader);
+
+  for (auto [src, dst, instr] : cfg) {
+    unsigned v = number.at(&src), w = number.at(&dst);
+    if (isAncestor(w, v))
+      backPreds[w].insert(v);
+    else
+      nonBackPreds[w].insert(v);
+  }
+
+  UnionFind uf(bb_count);
+
+  for (unsigned w = bb_count - 1; w != -1u; --w) {
+    set<unsigned> P;
+    for (unsigned v : backPreds[w])
+      if (v != w)
+        P.insert(uf.find(v));
+      else
+        type[w] = NodeType::self;
+
+    if (!P.empty())
+      type[w] = NodeType::reducible;
+
+    set<unsigned> workList(P);
+    while (!workList.empty()) {
+      unsigned x = *workList.begin();
+      workList.erase(x);
+
+      for (unsigned y : nonBackPreds[x]) {
+        unsigned yy = uf.find(y);
+        if (!isAncestor(w, yy)) {
+          type[w] = NodeType::irreducible;
+          nonBackPreds[w].insert(yy);
+        } else if (yy != w && !P.count(yy)) {
+          P.insert(yy);
+          workList.insert(yy);
+        }
+      }
+    }
+
+    for (unsigned x : P) {
+      header[x] = w;
+      uf.merge(x, w);
+    }
+  }
+}
+
+void LoopAnalysis::printDot(ostream &os) const {
+  os << "digraph {\n";
+  for (unsigned i = 0, e = f.getBBs().size(); i != e; ++i) {
+    if (type[i] == NodeType::nonheader)
+      continue;
+    os << '"' << bb_dot_name(node[i]->getName())
+       << "\" [shape=circle]\n";
+  }
+  for (unsigned i = 0, e = f.getBBs().size(); i != e; ++i) {
+    // do not draw self loop for root
+    if (header[i] == i)
+      continue;
+    if (type[i] == NodeType::nonheader ||
+        type[header[i]] == NodeType::nonheader)
+      continue;
+    os << '"' << bb_dot_name(node[header[i]]->getName()) << "\" -> \""
+       << bb_dot_name(node[i]->getName()) << "\";\n";
+  }
   os << "}\n";
 }
 

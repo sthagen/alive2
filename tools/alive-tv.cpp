@@ -63,8 +63,17 @@ static llvm::cl::opt<unsigned> opt_smt_to(
     "smt-to", llvm::cl::desc("Timeout for SMT queries (default=1000)"),
     llvm::cl::init(1000), llvm::cl::value_desc("ms"), llvm::cl::cat(opt_alive));
 
+static llvm::cl::opt<unsigned> opt_smt_random_seed(
+    "smt-random-seed",
+    llvm::cl::desc("Random seed for the SMT solver (default=0)"),
+    llvm::cl::init(0), llvm::cl::cat(opt_alive));
+
 static llvm::cl::opt<bool> opt_smt_verbose(
     "smt-verbose", llvm::cl::desc("SMT verbose mode"),
+    llvm::cl::cat(opt_alive), llvm::cl::init(false));
+
+static llvm::cl::opt<bool> opt_smt_log(
+    "smt-log", llvm::cl::desc("Log interactions with the SMT solver"),
     llvm::cl::cat(opt_alive), llvm::cl::init(false));
 
 static llvm::cl::opt<bool> opt_smt_skip(
@@ -84,6 +93,16 @@ static llvm::cl::opt<std::string> opt_src_fn(
 static llvm::cl::opt<std::string> opt_tgt_fn(
     "tgt-fn", llvm::cl::desc("Name of tgt function (without @)"),
     llvm::cl::cat(opt_alive), llvm::cl::init("tgt"));
+
+static llvm::cl::opt<unsigned> opt_src_unrolling_factor(
+    "src-unroll",
+    llvm::cl::desc("Unrolling factor for src function (default=0)"),
+    llvm::cl::cat(opt_alive), llvm::cl::init(0));
+
+static llvm::cl::opt<unsigned> opt_tgt_unrolling_factor(
+    "tgt-unroll",
+    llvm::cl::desc("Unrolling factor for tgt function (default=0)"),
+    llvm::cl::cat(opt_alive), llvm::cl::init(0));
 
 static llvm::cl::opt<bool> opt_tactic_verbose(
     "tactic-verbose", llvm::cl::desc("SMT Tactic verbose mode"),
@@ -264,8 +283,6 @@ static void compareFunctions(llvm::Function &F1, llvm::Function &F2,
 
   TransformPrintOpts print_opts;
 
-  omit_array_size = opt_omit_array_size;
-
   auto Func1 = llvm2alive(F1, llvm::TargetLibraryInfoWrapperPass(targetTriple)
                                     .getTLI(F1));
   if (!Func1) {
@@ -274,6 +291,7 @@ static void compareFunctions(llvm::Function &F1, llvm::Function &F2,
     ++errorCount;
     return;
   }
+  Func1->unroll(opt_src_unrolling_factor);
 
   auto Func2 = llvm2alive(F2, llvm::TargetLibraryInfoWrapperPass(targetTriple)
                                     .getTLI(F2), Func1->getGlobalVarNames());
@@ -283,6 +301,7 @@ static void compareFunctions(llvm::Function &F1, llvm::Function &F2,
     ++errorCount;
     return;
   }
+  Func2->unroll(opt_tgt_unrolling_factor);
 
   smt_init->reset();
   Transform t;
@@ -412,6 +431,7 @@ convenient way to demonstrate an existing optimizer bug.
   smt::solver_print_queries(opt_smt_verbose);
   smt::solver_tactic_verbose(opt_tactic_verbose);
   smt::set_query_timeout(to_string(opt_smt_to));
+  smt::set_random_seed(to_string(opt_smt_random_seed));
   smt::set_memory_limit((uint64_t)opt_max_mem * 1024 * 1024);
   config::skip_smt = opt_smt_skip;
   config::io_nobuiltin = opt_io_nobuiltin;
@@ -419,6 +439,9 @@ convenient way to demonstrate an existing optimizer bug.
   config::disable_undef_input = opt_disable_undef;
   config::disable_poison_input = opt_disable_poison;
   config::debug = opt_debug;
+
+  if (opt_smt_log)
+    smt::start_logging();
 
   // optionally, redirect cout and cerr to user-specified file
   if (!opt_outputfile.empty()) {
@@ -436,6 +459,7 @@ convenient way to demonstrate an existing optimizer bug.
   auto targetTriple = llvm::Triple(M1.get()->getTargetTriple());
 
   llvm_util::initializer llvm_util_init(cerr, DL);
+  omit_array_size = opt_omit_array_size;
   smt_init.emplace();
 
   unsigned goodCount = 0, badCount = 0, errorCount = 0;

@@ -609,6 +609,7 @@ static FastMathFlags parse_fast_math(token op_token) {
   }
 
   switch (op_token) {
+  case FABS:
   case FADD:
   case FSUB:
   case FMUL:
@@ -618,6 +619,8 @@ static FastMathFlags parse_fast_math(token op_token) {
   case FMA:
   case FMAX:
   case FMIN:
+  case FMAXIMUM:
+  case FMINIMUM:
     break;
   default:
     if (!fmath.isNone())
@@ -646,6 +649,8 @@ static unsigned parse_binop_flags(token op_token) {
   case FREM:
   case FMAX:
   case FMIN:
+  case FMAXIMUM:
+  case FMINIMUM:
   case SREM:
   case UREM:
   case UADD_SAT:
@@ -740,6 +745,8 @@ static unique_ptr<Instr> parse_binop(string_view name, token op_token) {
   case FREM: op = BinOp::FRem; break;
   case FMAX: op = BinOp::FMax; break;
   case FMIN: op = BinOp::FMin; break;
+  case FMAXIMUM: op = BinOp::FMaximum; break;
+  case FMINIMUM: op = BinOp::FMinimum; break;
   case UMIN: op = BinOp::UMin; break;
   case UMAX: op = BinOp::UMax; break;
   case SMIN: op = BinOp::SMin; break;
@@ -754,19 +761,23 @@ static unique_ptr<Instr> parse_binop(string_view name, token op_token) {
 }
 
 static unique_ptr<Instr> parse_unaryop(string_view name, token op_token) {
+  auto fmath = parse_fast_math(op_token);
+
   UnaryOp::Op op;
   switch (op_token) {
   case BITREVERSE: op = UnaryOp::BitReverse; break;
   case BSWAP:      op = UnaryOp::BSwap; break;
   case CTPOP:      op = UnaryOp::Ctpop; break;
   case FNEG:       op = UnaryOp::FNeg; break;
+  case FFS:        op = UnaryOp::FFS; break;
+  case FABS:       op = UnaryOp::FAbs; break;
   default:
     UNREACHABLE();
   }
 
   auto &ty = parse_type();
   auto &a = parse_operand(ty);
-  return make_unique<UnaryOp>(ty, string(name), a, op);
+  return make_unique<UnaryOp>(ty, string(name), a, op, fmath);
 }
 
 static unique_ptr<Instr> parse_unary_reduction_op(string_view name,
@@ -1100,6 +1111,8 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case FREM:
   case FMAX:
   case FMIN:
+  case FMAXIMUM:
+  case FMINIMUM:
   case UMIN:
   case UMAX:
   case SMIN:
@@ -1109,6 +1122,8 @@ static unique_ptr<Instr> parse_instr(string_view name) {
   case BITREVERSE:
   case BSWAP:
   case CTPOP:
+  case FFS:
+  case FABS:
   case FNEG:
     return parse_unaryop(name, t);
   case REDUCE_ADD:
@@ -1186,7 +1201,8 @@ static unique_ptr<Instr> parse_assume(bool if_non_poison) {
   tokenizer.ensure(LPAREN);
   auto &val = parse_operand(*int_types[1].get());
   tokenizer.ensure(RPAREN);
-  return make_unique<Assume>(val, if_non_poison);
+  return make_unique<Assume>(val, if_non_poison ? Assume::IfNonPoison :
+                                                  Assume::AndNonPoison);
 }
 
 static unique_ptr<Instr> parse_return() {
@@ -1220,7 +1236,7 @@ static void parse_fn(Function &f) {
     }
     case UNREACH:
       bb->addInstr(make_unique<Assume>(get_constant(0, *int_types[1].get()),
-                                       /*if_non_poison=*/false));
+                                       Assume::AndNonPoison));
       break;
     default:
       string_view name;

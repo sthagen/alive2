@@ -73,7 +73,7 @@ static string local_name(const State *s, const char *name) {
   return string(name) + (s->isSource() ? "_src" : "_tgt");
 }
 
-static bool is_initial_memblock(const expr &e, bool match_any_init = false) {
+static int is_initial_memblock(const expr &e, bool match_any_init = false) {
   string name;
   expr load, blk, idx;
   unsigned hi, lo;
@@ -83,9 +83,9 @@ static bool is_initial_memblock(const expr &e, bool match_any_init = false) {
     name = e.fn_name();
 
   if (string_view(name).substr(0, 9) == "init_mem_")
-    return true;
+    return 1;
 
-  return match_any_init && string_view(name).substr(0, 8) == "blk_val!";
+  return match_any_init && string_view(name).substr(0, 8) == "blk_val!" ? 2 : 0;
 }
 
 static expr load_bv(const expr &var, const expr &idx0) {
@@ -1495,9 +1495,10 @@ void Memory::mkAxioms(const Memory &tgt) const {
     Pointer q(tgt, bid, false);
     auto p_align = p.blockAlignment();
     auto q_align = q.blockAlignment();
-    state->addAxiom(expr::mkIf(p.isHeapAllocated(),
-                               p_align == align && q_align == align,
-                               p_align.ule(q_align)));
+    state->addAxiom(
+      p.isHeapAllocated().implies(p_align == align && q_align == align));
+    if (!p_align.isConst() || !q_align.isConst())
+      state->addAxiom(p_align.ule(q_align));
   }
 
   if (!observes_addresses())
@@ -1616,6 +1617,12 @@ pair<expr, expr> Memory::mkUndefInput(const ParamAttrs &attrs) const {
   return { p.release(), move(undef) };
 }
 
+expr Memory::PtrInput::operator==(const PtrInput &rhs) const {
+  if (byval != rhs.byval || nocapture != rhs.nocapture)
+    return false;
+  return val == rhs.val;
+}
+
 pair<expr,expr>
 Memory::mkFnRet(const char *name, const vector<PtrInput> &ptr_inputs) {
   bool has_local = escaped_local_blks.numMayAlias(true);
@@ -1658,18 +1665,37 @@ Memory::mkFnRet(const char *name, const vector<PtrInput> &ptr_inputs) {
   return { p.release(), move(var) };
 }
 
-expr Memory::CallState::implies(const CallState &st) const {
-  if (empty || st.empty)
-    return true;
-  // NOTE: using equality here is an approximation.
-  // TODO: benchmark using quantifiers to state implication
-  expr ret(true);
-  for (unsigned i = 0, e = non_local_block_val.size(); i != e; ++i) {
-    ret &= non_local_block_val[i] == st.non_local_block_val[i];
+Memory::CallState Memory::CallState::mkIf(const expr &cond,
+                                          const CallState &then,
+                                          const CallState &els) {
+  CallState ret;
+  for (unsigned i = 0, e = then.non_local_block_val.size(); i != e; ++i) {
+    ret.non_local_block_val.emplace_back(
+      expr::mkIf(cond, then.non_local_block_val[i],
+                 els.non_local_block_val[i]));
   }
-  if (liveness_var.isValid() && st.liveness_var.isValid())
-    ret &= liveness_var == st.liveness_var;
+  ret.non_local_block_liveness
+    = expr::mkIf(cond, then.non_local_block_liveness,
+                 els.non_local_block_liveness);
   return ret;
+}
+
+expr Memory::CallState::operator==(const CallState &rhs) const {
+  if (empty != rhs.empty)
+    return false;
+  if (empty)
+    return true;
+
+  expr ret = non_local_block_liveness == rhs.non_local_block_liveness;
+  for (unsigned i = 0, e = non_local_block_val.size(); i != e; ++i) {
+    ret &= non_local_block_val[i] == rhs.non_local_block_val[i];
+  }
+  return ret;
+}
+
+bool Memory::CallState::operator<(const CallState &rhs) const {
+  return tie(non_local_block_val, non_local_block_liveness) <
+         tie(rhs.non_local_block_val, rhs.non_local_block_liveness);
 }
 
 Memory::CallState
@@ -1722,10 +1748,10 @@ Memory::mkCallState(const vector<PtrInput> *ptr_inputs, bool nofree) const {
     if (mask.isAllOnes()) {
       st.non_local_block_liveness = non_local_block_liveness;
     } else {
-      st.liveness_var = expr::mkFreshVar("blk_liveness", mk_liveness_array());
+      auto liveness_var = expr::mkFreshVar("blk_liveness", mk_liveness_array());
       // functions can free an object, but cannot bring a dead one back to live
       st.non_local_block_liveness
-        = non_local_block_liveness & (st.liveness_var | mask);
+        = non_local_block_liveness & (liveness_var | mask);
     }
   } else {
     st.non_local_block_liveness = non_local_block_liveness;
@@ -2130,6 +2156,21 @@ expr Memory::blockValRefined(const Memory &other, unsigned bid, bool local,
   if (mem1.val.eq(mem2))
     return true;
 
+  int is_fn1 = is_initial_memblock(mem1.val, true);
+  int is_fn2 = is_initial_memblock(mem2, true);
+  if (is_fn1 && is_fn2) {
+    // if both memories are the result of a function call, then refinement
+    // holds iif they are equal, otherwise we can always force a behavior
+    // of the function such that it will store a different value to memory
+    if (is_fn1 == 2 && is_fn2 == 2)
+      return mem1.val == mem2;
+
+    // an inital memory (m0) vs a function call is always false, as a function
+    // may always store something to memory
+    assert((is_fn1 == 1 && is_fn2 == 2) || (is_fn1 == 2 && is_fn2 == 1));
+    return false;
+  }
+
   Byte val(*this, mem1.val.load(offset));
   Byte val2(other, mem2.load(offset));
 
@@ -2209,12 +2250,18 @@ expr Memory::blockRefined(const Pointer &src, const Pointer &tgt, unsigned bid,
 
   assert(src.isWritable().eq(tgt.isWritable()));
 
+  expr aligned(true);
+  expr src_align = src.blockAlignment();
+  expr tgt_align = tgt.blockAlignment();
+  // if they are both non-const, then the condition holds per the precondition
+  if (src_align.isConst() || tgt_align.isConst())
+    aligned = src_align.ule(tgt_align);
+
   expr alive = src.isBlockAlive();
   return alive == tgt.isBlockAlive() &&
          blk_size == tgt.blockSize() &&
          src.getAllocType() == tgt.getAllocType() &&
-         state->simplifyWithAxioms(
-           src.blockAlignment().ule(tgt.blockAlignment())) &&
+         aligned &&
          alive.implies(val_refines);
 }
 
@@ -2348,8 +2395,7 @@ Memory Memory::mkIf(const expr &cond, const Memory &then, const Memory &els) {
 
 bool Memory::operator<(const Memory &rhs) const {
   // FIXME: remove this once we move to C++20
-  // NOTE: we don't compare field state so that memories from src/tgt can
-  // compare equal
+  assert(state == rhs.state);
   return
     tie(non_local_block_val, local_block_val,
         non_local_block_liveness, local_block_liveness, local_blk_addr,
@@ -2364,6 +2410,32 @@ bool Memory::operator<(const Memory &rhs) const {
         rhs.non_local_blk_size, rhs.non_local_blk_align,
         rhs.non_local_blk_kind, rhs.byval_blks, rhs.escaped_local_blks,
         rhs.ptr_alias, rhs.next_nonlocal_bid);
+}
+
+bool Memory::cmpFnCallInput(const Memory &rhs) const {
+  assert(state == rhs.state && state->isSource());
+  // first compare non-local memory only
+  auto nla = tie(non_local_block_val, non_local_block_liveness,
+                 non_local_blk_size, non_local_blk_align, non_local_blk_kind,
+                 byval_blks, escaped_local_blks);
+  auto nlb = tie(rhs.non_local_block_val, rhs.non_local_block_liveness,
+                 rhs.non_local_blk_size, rhs.non_local_blk_align,
+                 rhs.non_local_blk_kind, rhs.byval_blks,
+                 rhs.escaped_local_blks);
+  if (nla < nlb)
+    return true;
+  if (nla > nlb)
+    return false;
+
+  // if nothing local escaped, then memories are equivalent for the callee
+  if (escaped_local_blks.numMayAlias(true) == 0)
+    return false;
+
+  return
+    tie(local_block_val, local_block_liveness, local_blk_addr, local_blk_size,
+        local_blk_align, local_blk_kind) <
+    tie(rhs.local_block_val, rhs.local_block_liveness, rhs.local_blk_addr,
+        rhs.local_blk_size, rhs.local_blk_align, rhs.local_blk_kind);
 }
 
 #define P(name, expr) do {      \

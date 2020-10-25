@@ -240,6 +240,8 @@ space+ {
 "fma" { return FMA; }
 "fmax" { return FMAX; }
 "fmin" { return FMIN; }
+"fmaximum" { return FMAXIMUM; }
+"fminimum" { return FMINIMUM; }
 "extractelement" { return EXTRACTELEMENT; }
 "insertelement" { return INSERTELEMENT; }
 "shufflevector" { return SHUFFLEVECTOR; }
@@ -249,6 +251,7 @@ space+ {
 "cttz" { return CTTZ; }
 "ctlz" { return CTLZ; }
 "ctpop" { return CTPOP; }
+"ffs" { return FFS; }
 "extractvalue" { return EXTRACTVALUE; }
 "insertvalue" { return INSERTVALUE; }
 "sadd_overflow" { return SADD_OVERFLOW; }
@@ -266,6 +269,7 @@ space+ {
 "reduce_smin" { return REDUCE_SMIN; }
 "reduce_umax" { return REDUCE_UMAX; }
 "reduce_umin" { return REDUCE_UMIN; }
+"fabs" { return FABS; }
 "fadd" { return FADD; }
 "fsub" { return FSUB; }
 "fmul" { return FMUL; }

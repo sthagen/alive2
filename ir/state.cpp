@@ -32,18 +32,58 @@ expr State::DomainPreds::operator()() const {
   return path() && *UB();
 }
 
+template<class T>
+static T intersect_set(const T &a, const T &b) {
+  T results;
+  set_intersection(a.begin(), a.end(), b.begin(), b.end(),
+                   inserter(results, results.begin()));
+  return results;
+}
+
 void State::ValueAnalysis::intersect(const State::ValueAnalysis &other) {
-  set<const Value*> results;
-  set_intersection(non_poison_vals.begin(), non_poison_vals.end(),
-      other.non_poison_vals.begin(), other.non_poison_vals.end(),
-      inserter(results, results.begin()));
-  non_poison_vals = move(results);
+  non_poison_vals = intersect_set(non_poison_vals, other.non_poison_vals);
+  non_undef_vals = intersect_set(non_undef_vals, other.non_undef_vals);
+  unused_vars = intersect_set(unused_vars, other.unused_vars);
+
+  for (auto &[fn, interval] : other.ranges_fn_calls) {
+    auto [I, inserted] = ranges_fn_calls.try_emplace(fn, 0, interval.second);
+    if (!inserted) {
+      I->second.first  = min(I->second.first, interval.first);
+      I->second.second = max(I->second.second, interval.second);
+    }
+  }
+
+  for (auto &[fn, interval] : ranges_fn_calls) {
+    if (!other.ranges_fn_calls.count(fn))
+      interval.first = 0;
+  }
 }
 
-void State::ValueAnalysis::reset() {
-  non_poison_vals.clear();
-}
+bool
+State::ValueAnalysis::FnCallRanges::overlaps(const FnCallRanges &other) const {
+  auto overlaps = [](auto &a, auto &b) {
+    return (a.first <= b.first && a.second >= b.first) ||
+           (b.first <= a.first && b.second >= a.first);
+  };
 
+  for (auto &[fn, interval] : *this) {
+    auto I = other.find(fn);
+    if (I == other.end()) {
+      if (interval.first == 0)
+        continue;
+      return false;
+    }
+    if (!overlaps(interval, I->second))
+      return false;
+  }
+
+  for (auto &[fn, interval] : other) {
+    if (interval.first != 0 && !count(fn))
+      return false;
+  }
+
+  return true;
+}
 
 State::State(Function &f, bool source)
   : f(f), source(source), memory(*this),
@@ -57,7 +97,8 @@ const StateValue& State::exec(const Value &v) {
   assert(undef_vars.empty());
   auto val = v.toSMT(*this);
   ENSURE(values_map.try_emplace(&v, (unsigned)values.size()).second);
-  values.emplace_back(&v, ValTy(move(val), move(undef_vars)), false);
+  values.emplace_back(&v, ValTy(move(val), move(undef_vars)));
+  analysis.unused_vars.insert(&v);
 
   // cleanup potentially used temporary values due to undef rewriting
   while (i_tmp_values > 0) {
@@ -67,28 +108,209 @@ const StateValue& State::exec(const Value &v) {
   return get<1>(values.back()).first;
 }
 
+static expr eq_except_padding(const Type &ty, const expr &e1, const expr &e2) {
+  const auto *aty = ty.getAsAggregateType();
+  if (!aty)
+    return e1 == e2;
+
+  StateValue sv1{expr(e1), expr()};
+  StateValue sv2{expr(e2), expr()};
+  expr result = true;
+
+  for (unsigned i = 0; i < aty->numElementsConst(); ++i) {
+    if (aty->isPadding(i))
+      continue;
+
+    result &= eq_except_padding(aty->getChild(i), aty->extract(sv1, i).value,
+                                aty->extract(sv2, i).value);
+  }
+  return result;
+}
+
+expr State::strip_undef_and_add_ub(const Value &val, const expr &e) {
+  if (isUndef(e)) {
+    addUB(expr(false));
+    return expr::mkUInt(0, e);
+  }
+
+  auto is_undef_cond = [](const expr &e, const expr &var) {
+    expr lhs, rhs;
+    // (= #b0 isundef_%var)
+    if (e.isEq(lhs, rhs)) {
+      return (lhs.isZero() && Input::isUndefMask(rhs, var)) ||
+             (rhs.isZero() && Input::isUndefMask(lhs, var));
+    }
+    return false;
+  };
+
+  auto is_if_undef = [&](const expr &e, expr &var, expr &not_undef) {
+    expr undef;
+    // (ite (= #b0 isundef_%var) %var undef)
+    return e.isIf(not_undef, var, undef) &&
+           isUndef(undef) &&
+           is_undef_cond(not_undef, var);
+  };
+
+  expr c, a, b, lhs, rhs;
+
+  // two variants
+  // 1) boolean
+  if (is_if_undef(e, a, b)) {
+    addUB(move(b));
+    return a;
+  }
+
+  auto has_undef = [&](const expr &e) {
+    auto vars = e.vars();
+    return any_of(vars.begin(), vars.end(),
+                  [&](auto &v) { return isUndef(v); });
+  };
+
+  auto mark_notundef = [&](const expr &var) {
+    auto name = var.fn_name();
+    for (auto &v : values_map) {
+      if (v.first->getName() == name) {
+        analysis.non_undef_vals.emplace(v.first, var);
+        return;
+      }
+    }
+  };
+
+  if (e.isIf(c, a, b) && a.isConst() && b.isConst()) {
+    expr val, val2, not_undef, not_undef2;
+    // (ite (= val (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
+    if (c.isEq(lhs, rhs)) {
+      if (is_if_undef(lhs, val, not_undef) && !has_undef(rhs)) {
+        addUB(move(not_undef));
+        mark_notundef(val);
+        return expr::mkIf(val == rhs, a, b);
+      }
+      if (is_if_undef(rhs, val, not_undef) && !has_undef(lhs)) {
+        addUB(move(not_undef));
+        mark_notundef(val);
+        return expr::mkIf(lhs == val, a, b);
+      }
+      if (is_if_undef(lhs, val, not_undef) &&
+          is_if_undef(rhs, val2, not_undef2)) {
+        addUB(move(not_undef));
+        addUB(move(not_undef2));
+        mark_notundef(val);
+        mark_notundef(val2);
+        return expr::mkIf(val == val2, a, b);
+      }
+    }
+
+    if (c.isSLE(lhs, rhs)) {
+      // (ite (bvsle val (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
+      if (is_if_undef(rhs, val, not_undef) && !has_undef(lhs)) {
+        addUB(not_undef || lhs == expr::IntSMin(lhs.bits()));
+        mark_notundef(val);
+        return expr::mkIf(lhs.sle(val), a, b);
+      }
+
+      // (ite (bvsle (ite (= #b0 isundef_%var) %var undef) val) #b1 #b0)
+      if (is_if_undef(lhs, val, not_undef) && !has_undef(rhs)) {
+        addUB(not_undef || rhs == expr::IntSMax(rhs.bits()));
+        mark_notundef(val);
+        return expr::mkIf(val.sle(rhs), a, b);
+      }
+
+      // undef <= undef
+      if (is_if_undef(lhs, val, not_undef) &&
+          is_if_undef(rhs, val2, not_undef2)) {
+        addUB((not_undef && not_undef2) ||
+              (not_undef && val == expr::IntSMin(lhs.bits())) ||
+              (not_undef2 && val2 == expr::IntSMax(rhs.bits())));
+        return expr::mkIf(val.sle(val2), a, b);
+      }
+    }
+
+    if (c.isULE(lhs, rhs)) {
+      // (ite (bvule val (ite (= #b0 isundef_%var) %var undef)) #b1 #b0)
+      if (is_if_undef(rhs, val, not_undef) && !has_undef(lhs)) {
+        addUB(not_undef || lhs == 0);
+        mark_notundef(val);
+        return expr::mkIf(lhs.ule(val), a, b);
+      }
+
+      // (ite (bvule (ite (= #b0 isundef_%var) %var undef) val) #b1 #b0)
+      if (is_if_undef(lhs, val, not_undef) && !has_undef(rhs)) {
+        addUB(not_undef || rhs == expr::mkInt(-1, rhs));
+        mark_notundef(val);
+        return expr::mkIf(val.ule(rhs), a, b);
+      }
+
+      // undef <= undef
+      if (is_if_undef(lhs, val, not_undef) &&
+          is_if_undef(rhs, val2, not_undef2)) {
+        addUB((not_undef && not_undef2) ||
+              (not_undef && val == 0) ||
+              (not_undef2 && val2 == expr::mkInt(-1, rhs)));
+        return expr::mkIf(val.ule(val2), a, b);
+      }
+    }
+  }
+
+  // 2) (or (and |isundef_%var| undef) (and %var (not |isundef_%var|)))
+  // TODO
+
+  // check if original expression is equal to an expression where undefs are
+  // fixed to a const value
+  vector<pair<expr,expr>> repls;
+  for (auto &undef : undef_vars) {
+    repls.emplace_back(undef, expr::some(undef));
+  }
+  addUB(eq_except_padding(val.getType(), e, e.subst(repls)));
+  return e;
+}
+
 const StateValue& State::operator[](const Value &val) {
-  auto &[var, val_uvars, used] = values[values_map.at(&val)];
+  auto &[var, val_uvars] = values[values_map.at(&val)];
   auto &[sval, uvars] = val_uvars;
   (void)var;
 
-  auto simplify = [&](StateValue &sv, bool use_new_slot) -> StateValue& {
+  auto undef_itr = analysis.non_undef_vals.find(&val);
+  bool is_non_undef = undef_itr != analysis.non_undef_vals.end();
+
+  auto simplify = [&](StateValue &sv0, bool use_new_slot) -> StateValue&{
+    StateValue *sv = &sv0;
     if (analysis.non_poison_vals.count(&val)) {
       if (use_new_slot) {
         assert(i_tmp_values < tmp_values.size());
-        tmp_values[i_tmp_values++] = sv;
+        tmp_values[i_tmp_values++] = *sv;
+        use_new_slot = false;
       }
       assert(i_tmp_values > 0);
       StateValue &sv_new = tmp_values[i_tmp_values - 1];
       const expr &np = sv_new.non_poison;
-      sv_new.non_poison = np.isBool() ? true : expr::mkUInt(0, np.bits());
-      return sv_new;
+      sv_new.non_poison = np.isBool() ? true : expr::mkUInt(0, np);
+      sv = &sv_new;
     }
-    return sv;
+
+    if (is_non_undef) {
+      if (use_new_slot) {
+        assert(i_tmp_values < tmp_values.size());
+        tmp_values[i_tmp_values++] = *sv;
+      }
+      assert(i_tmp_values > 0);
+      StateValue &sv_new = tmp_values[i_tmp_values - 1];
+      sv_new.value = undef_itr->second;
+      sv = &sv_new;
+    }
+    return *sv;
   };
 
-  if (uvars.empty() || !used || disable_undef_rewrite) {
-    used = true;
+  if (is_non_undef) {
+    // We don't need to add uvar to undef_vars
+    quantified_vars.insert(uvars.begin(), uvars.end());
+    return simplify(sval, true);
+  }
+
+  auto unused_itr = analysis.unused_vars.find(&val);
+  bool unused = unused_itr != analysis.unused_vars.end();
+  if (uvars.empty() || unused || disable_undef_rewrite) {
+    if (unused)
+      analysis.unused_vars.erase(unused_itr);
     undef_vars.insert(uvars.begin(), uvars.end());
     return simplify(sval, true);
   }
@@ -123,35 +345,72 @@ const StateValue& State::getAndAddUndefs(const Value &val) {
   return v;
 }
 
-const StateValue& State::getAndAddPoisonUB(const Value &val) {
-  auto &v = (*this)[val];
-  if (!analysis.non_poison_vals.insert(&val).second)
-    return v;
-
-  // mark all operands of val as non-poison if they propagate poison
-  vector<Value*> todo;
-  if (auto i = dynamic_cast<const Instr*>(&val)) {
-    if (i->propagatesPoison())
-      todo = i->operands();
+static expr not_poison_except_padding(const Type &ty, const expr &np) {
+  const auto *aty = ty.getAsAggregateType();
+  if (!aty) {
+    assert(!np.isValid() || np.isBool());
+    return np;
   }
-  while (!todo.empty()) {
-    auto v = todo.back();
-    todo.pop_back();
-    if (!analysis.non_poison_vals.insert(v).second)
+
+  StateValue sv{expr(), expr(np)};
+  expr result = true;
+
+  for (unsigned i = 0; i < aty->numElementsConst(); ++i) {
+    if (aty->isPadding(i))
       continue;
-    if (auto i = dynamic_cast<const Instr*>(v)) {
-      if (i->propagatesPoison()) {
-        auto ops = i->operands();
-        todo.insert(todo.end(), ops.begin(), ops.end());
-      }
+
+    result &= not_poison_except_padding(aty->getChild(i),
+                                        aty->extract(sv, i).non_poison);
+  }
+  return result;
+}
+
+const StateValue&
+State::getAndAddPoisonUB(const Value &val, bool undef_ub_too) {
+  auto &sv = (*this)[val];
+
+  bool poison_already_added = !analysis.non_poison_vals.insert(&val).second;
+  if (poison_already_added && !undef_ub_too)
+    return sv;
+
+  expr v = sv.value;
+
+  if (undef_ub_too) {
+    auto I = analysis.non_undef_vals.find(&val);
+    if (I != analysis.non_undef_vals.end()) {
+      v = I->second;
+    } else {
+      v = strip_undef_and_add_ub(val, v);
+      analysis.non_undef_vals.emplace(&val, v);
     }
   }
 
-  // If val is an aggregate, all elements should be non-poison
-  addUB(v.non_poison.isBool() ? v.non_poison : v.non_poison == 0);
+  if (!poison_already_added) {
+    // mark all operands of val as non-poison if they propagate poison
+    vector<Value*> todo;
+    if (auto i = dynamic_cast<const Instr*>(&val)) {
+      if (i->propagatesPoison())
+        todo = i->operands();
+    }
+    while (!todo.empty()) {
+      auto v = todo.back();
+      todo.pop_back();
+      if (!analysis.non_poison_vals.insert(v).second)
+        continue;
+      if (auto i = dynamic_cast<const Instr*>(v)) {
+        if (i->propagatesPoison()) {
+          auto ops = i->operands();
+          todo.insert(todo.end(), ops.begin(), ops.end());
+        }
+      }
+    }
+
+    // If val is an aggregate, all elements should be non-poison
+    addUB(not_poison_except_padding(val.getType(), sv.non_poison));
+  }
   assert(i_tmp_values < tmp_values.size());
-  return tmp_values[i_tmp_values++] = { expr(v.value),
-        v.non_poison.isBool() ? true : expr::mkUInt(0, v.non_poison.bits()) };
+  return tmp_values[i_tmp_values++] = { move(v),
+           sv.non_poison.isBool() ? true : expr::mkUInt(0, sv.non_poison) };
 }
 
 const State::ValTy& State::at(const Value &val) const {
@@ -174,7 +433,6 @@ bool State::startBB(const BasicBlock &bb) {
   current_bb = &bb;
 
   domain.reset();
-  analysis.reset();
 
   if (&f.getFirstBB() == &bb)
     return true;
@@ -288,6 +546,119 @@ void State::addNoReturn() {
   addUB(expr(false));
 }
 
+expr State::FnCallInput::operator==(const FnCallInput &rhs) const {
+  if (readsmem != rhs.readsmem ||
+      argmemonly != rhs.argmemonly ||
+      fncall_ranges != rhs.fncall_ranges ||
+      m < rhs.m || rhs.m < m)
+    return false;
+
+  AndExpr eq;
+  for (unsigned i = 0, e = args_nonptr.size(); i != e; ++i) {
+    eq.add(args_nonptr[i] == rhs.args_nonptr[i]);
+  }
+
+  for (unsigned i = 0, e = args_ptr.size(); i != e; ++i) {
+    eq.add(args_ptr[i] == rhs.args_ptr[i]);
+  }
+  return eq();
+}
+
+expr State::FnCallInput::refinedBy(
+  State &s, const vector<StateValue> &args_nonptr2,
+  const vector<Memory::PtrInput> &args_ptr2,
+  const ValueAnalysis::FnCallRanges &fncall_ranges2,
+  const Memory &m2, bool readsmem2, bool argmemonly2) const {
+
+  if (readsmem != readsmem2 || argmemonly != argmemonly2 ||
+      !fncall_ranges.overlaps(fncall_ranges2))
+    return false;
+
+  AndExpr refines;
+  for (unsigned i = 0, e = args_nonptr.size(); i != e; ++i) {
+    refines.add(args_nonptr[i].non_poison.implies(
+      args_nonptr[i].value == args_nonptr2[i].value &&
+      args_nonptr2[i].non_poison));
+  }
+
+  if (!refines)
+    return false;
+
+  set<expr> undef_vars;
+  for (unsigned i = 0, e = args_ptr.size(); i != e; ++i) {
+    // TODO: needs to take read/read2 as input to control if mem blocks
+    // need to be compared
+    auto &[ptr_in, is_byval, is_nocapture] = args_ptr[i];
+    auto &[ptr_in2, is_byval2, is_nocapture2] = args_ptr2[i];
+    if (is_byval != is_byval2 || is_nocapture != is_nocapture2)
+      return false;
+
+    expr eq_val = Pointer(m, ptr_in.value)
+                    .fninputRefined(Pointer(m2, ptr_in2.value),
+                                    undef_vars, is_byval2);
+    refines.add(ptr_in.non_poison.implies(eq_val && ptr_in2.non_poison));
+
+    if (!refines)
+      return false;
+  }
+
+  for (auto &v : undef_vars)
+    s.addFnQuantVar(v);
+
+  if (readsmem) {
+    auto restrict_ptrs = argmemonly2 ? &args_ptr2 : nullptr;
+    auto data = m.refined(m2, true, restrict_ptrs);
+    refines.add(get<0>(data));
+    for (auto &v : get<2>(data))
+      s.addFnQuantVar(v);
+  }
+
+  return refines();
+}
+
+bool State::FnCallInput::operator<(const FnCallInput &rhs) const {
+  return tie(args_nonptr, args_ptr, fncall_ranges, m, readsmem, argmemonly) <
+         tie(rhs.args_nonptr, rhs.args_ptr, rhs.fncall_ranges, rhs.m,
+             rhs.readsmem, rhs.argmemonly);
+#if 0
+  auto a = tie(args_nonptr, args_ptr, fncall_ranges, readsmem, argmemonly);
+  auto b = tie(rhs.args_nonptr, rhs.args_ptr, rhs.fncall_ranges, rhs.readsmem,
+               rhs.argmemonly);
+  if (a < b)
+    return true;
+  if (a > b)
+    return false;
+  return m.cmpFnCallInput(rhs.m);
+#endif
+}
+
+State::FnCallOutput State::FnCallOutput::mkIf(const expr &cond,
+                                              const FnCallOutput &a,
+                                              const FnCallOutput &b) {
+  FnCallOutput ret;
+  ret.ub = expr::mkIf(cond, a.ub, b.ub);
+  ret.callstate = Memory::CallState::mkIf(cond, a.callstate, b.callstate);
+  assert(a.retvals.size() == b.retvals.size());
+  for (unsigned i = 0, e = a.retvals.size(); i != e; ++i) {
+    ret.retvals.emplace_back(
+      StateValue::mkIf(cond, a.retvals[i], b.retvals[i]));
+  }
+  return ret;
+}
+
+expr State::FnCallOutput::operator==(const FnCallOutput &rhs) const {
+  expr ret = ub == rhs.ub;
+  for (unsigned i = 0, e = retvals.size(); i != e; ++i) {
+    ret &= retvals[i] == rhs.retvals[i];
+  }
+  ret &= callstate == rhs.callstate;
+  return ret;
+}
+
+bool State::FnCallOutput::operator<(const FnCallOutput &rhs) const {
+  return tie(retvals, ub, callstate) < tie(rhs.retvals, rhs.ub, rhs.callstate);
+}
+
 vector<StateValue>
 State::addFnCall(const string &name, vector<StateValue> &&inputs,
                  vector<Memory::PtrInput> &&ptr_inputs,
@@ -314,51 +685,108 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
       memory.escapeLocalPtr(v.val.value);
   }
 
-  // TODO: this doesn't need to compare the full memory, just a subset of fields
-  auto call_data_pair
-    = fn_call_data[name].try_emplace({ move(inputs), move(ptr_inputs),
-                                       memory, reads_memory, argmemonly });
-  auto &I = call_data_pair.first;
-  bool inserted = call_data_pair.second;
+  vector<StateValue> retval;
 
-  if (inserted) {
-    auto mk_val = [&](const Type &t, const string &name) {
-      if (t.isPtrType())
-        return memory.mkFnRet(name.c_str(), I->first.args_ptr).first;
+  // source may create new fn symbols, target just references src symbols
+  if (isSource()) {
+    auto &calls_fn = fn_call_data[name];
+    auto call_data_pair
+      = calls_fn.try_emplace({ move(inputs), move(ptr_inputs),
+                               analysis.ranges_fn_calls,
+                               reads_memory ? memory : Memory(*this),
+                               reads_memory, argmemonly });
+    auto &I = call_data_pair.first;
+    bool inserted = call_data_pair.second;
 
-      return expr::mkFreshVar(name.c_str(), t.getDummyValue(false).value);
-    };
+    if (inserted) {
+      auto mk_val = [&](const Type &t, const string &name) {
+        return t.isPtrType()
+                 // TODO: remove 2nd ret val of mkFnRet
+                 ? memory.mkFnRet(name.c_str(), I->first.args_ptr).first
+                 : expr::mkFreshVar(name.c_str(), t.getDummyValue(false).value);
+      };
 
-    vector<StateValue> values;
-    string valname = name + "#val";
-    string npname = name + "#np";
-    for (auto t : out_types) {
-      expr np = noundef ? expr(true) : expr::mkFreshVar(npname.c_str(), false);
-      values.emplace_back(mk_val(*t, valname), move(np));
+      vector<StateValue> values;
+      string valname = name + "#val";
+      string npname = name + "#np";
+      for (auto t : out_types) {
+        values.emplace_back(
+          mk_val(*t, valname),
+          noundef ? expr(true) : expr::mkFreshVar(npname.c_str(), false));
+      }
+
+      string ub_name = name + "#ub";
+      I->second
+        = { move(values), expr::mkFreshVar(ub_name.c_str(), false),
+            writes_memory
+              ? memory.mkCallState(argmemonly ? &I->first.args_ptr : nullptr,
+                                   attrs.has(FnAttrs::NoFree))
+              : Memory::CallState() };
+
+      // add equality constraints between source's function calls
+      for (auto II = calls_fn.begin(), E = calls_fn.end(); II != E; ++II) {
+        if (II == I)
+          continue;
+        fn_call_pre &= (I->first == II->first).implies(I->second == II->second);
+      }
     }
 
-    string ub_name = name + "#ub";
-    I->second
-      = { move(values), expr::mkFreshVar(ub_name.c_str(), false),
-          writes_memory
-            ? memory.mkCallState(argmemonly ? &I->first.args_ptr : nullptr,
-                               attrs.has(FnAttrs::NoFree))
-            : Memory::CallState(),
-          true };
-  } else {
-    I->second.used = true;
+    addUB(I->second.ub);
+    retval = I->second.retvals;
+    if (writes_memory)
+      memory.setState(I->second.callstate);
+  }
+  else {
+    // target: this fn call must match one from the source, otherwise it's UB
+    ChoiceExpr<FnCallOutput> data;
+
+    for (auto &[in, out] : fn_call_data[name]) {
+      auto refined = in.refinedBy(*this, inputs, ptr_inputs,
+                                  analysis.ranges_fn_calls, memory,
+                                  reads_memory, argmemonly);
+      data.add(out, move(refined));
+    }
+
+    if (data) {
+      auto [d, domain, qvar, pre] = data();
+      addUB(move(domain));
+      addUB(move(d.ub));
+      retval = move(d.retvals);
+      if (writes_memory)
+        memory.setState(d.callstate);
+
+      fn_call_pre &= pre;
+      if (qvar.isValid())
+        fn_call_qvars.emplace(move(qvar));
+    } else {
+      addUB(expr(false));
+      for (auto *t : out_types) {
+        retval.emplace_back(t->getDummyValue(false));
+      }
+    }
   }
 
-  addUB(I->second.ub);
+  if (writes_memory) {
+    auto [I, inserted] = analysis.ranges_fn_calls.try_emplace(name, 1, 1);
+    if (!inserted) {
+      ++I->second.first;
+      ++I->second.second;
+    }
+  }
 
-  if (writes_memory)
-    memory.setState(I->second.callstate);
+  return retval;
+}
 
-  return I->second.retvals;
+void State::useUnsupported(const char *name) {
+  used_unsupported.emplace(name);
 }
 
 void State::addQuantVar(const expr &var) {
   quantified_vars.emplace(var);
+}
+
+void State::addFnQuantVar(const expr &var) {
+  fn_call_qvars.emplace(var);
 }
 
 void State::addUndefVar(expr &&var) {
@@ -435,100 +863,12 @@ void State::syncSEdataWithSrc(const State &src) {
     itm.second.second = false;
 
   fn_call_data = src.fn_call_data;
-  for (auto &[fn, map] : fn_call_data) {
-   (void)fn;
-    for (auto &[in, data] : map) {
-      (void)in;
-      data.used = false;
-    }
-  }
-
   memory.syncWithSrc(src.returnMemory());
 }
 
 void State::mkAxioms(State &tgt) {
   assert(isSource() && !tgt.isSource());
   returnMemory().mkAxioms(tgt.returnMemory());
-
-  // axioms for function calls
-  // We would potentially need to do refinement check of tgt x tgt, but it
-  // doesn't seem to be needed in practice for optimizations
-  // since there's no introduction of calls in tgt
-  for (auto &[fn, data] : fn_call_data) {
-    auto &data2 = tgt.fn_call_data.at(fn);
-
-    for (auto I = data.begin(), E = data.end(); I != E; ++I) {
-      auto &[ins, ptr_ins, mem, reads, argmem] = I->first;
-      auto &[rets, ub, mem_state, used] = I->second;
-      assert(used); (void)used;
-
-      for (auto I2 = data2.begin(), E2 = data2.end(); I2 != E2; ++I2) {
-        auto &[ins2, ptr_ins2, mem2, reads2, argmem2] = I2->first;
-        auto &[rets2, ub2, mem_state2, used2] = I2->second;
-
-        if (!used2 || reads != reads2 || argmem != argmem2 || ub.eq(ub2))
-          continue;
-
-        expr refines(true);
-        for (unsigned i = 0, e = ins.size(); i != e; ++i) {
-          refines &= ins[i].non_poison.implies(ins[i].value == ins2[i].value &&
-                                               ins2[i].non_poison);
-        }
-
-        if (refines.isFalse())
-          continue;
-
-        set<expr> undef_vars;
-        for (unsigned i = 0, e = ptr_ins.size(); i != e; ++i) {
-          // TODO: needs to take read/read2 as input to control if mem blocks
-          // need to be compared
-          auto &[ptr_in, is_byval, is_nocapture] = ptr_ins[i];
-          auto &[ptr_in2, is_byval2, is_nocapture2] = ptr_ins2[i];
-          (void)is_nocapture;
-          (void)is_nocapture2;
-          if (!is_byval && is_byval2) {
-            // byval is added at target; this is not supported yet.
-            refines = false;
-            break;
-          }
-          expr eq_val = Pointer(mem, ptr_in.value)
-                          .fninputRefined(Pointer(mem2, ptr_in2.value),
-                                          undef_vars, is_byval2);
-          refines &= ptr_in.non_poison
-                       .implies(eq_val && ptr_in2.non_poison);
-
-          if (refines.isFalse())
-            break;
-        }
-
-        if (refines.isFalse())
-          continue;
-
-        quantified_vars.insert(undef_vars.begin(), undef_vars.end());
-
-        if (reads2) {
-          auto restrict_ptrs = argmem2 ? &ptr_ins2 : nullptr;
-          auto data = mem.refined(mem2, true, restrict_ptrs);
-          refines &= get<0>(data);
-          quantified_vars.insert(get<2>(data).begin(), get<2>(data).end());
-        }
-
-        expr ref_expr(true);
-        for (unsigned i = 0, e = rets.size(); i != e; ++i) {
-          ref_expr &=
-            rets[i].non_poison.implies(rets2[i].non_poison &&
-                                       rets[i].value == rets2[i].value);
-        }
-        tgt.addPre(refines.implies(ref_expr &&
-                                   ub.implies(ub2) &&
-                                   mem_state.implies(mem_state2)));
-      }
-    }
-  }
-}
-
-expr State::simplifyWithAxioms(expr &&e) const {
-  return axioms.contains(e) ? expr(true) : move(e);
 }
 
 }
