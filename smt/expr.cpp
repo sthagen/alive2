@@ -52,7 +52,8 @@ expr::expr(Z3_ast ast) : ptr((uintptr_t)ast) {
 }
 
 bool expr::isZ3Ast() const {
-  return (ptr & 1) == 0;
+  return true;
+  //return (ptr & 1) == 0;
 }
 
 Z3_ast expr::ast() const {
@@ -257,7 +258,7 @@ expr expr::mkFreshVar(const char *prefix, const expr &type) {
 }
 
 expr expr::some(const expr &type) {
-  return type.isBool() ? expr(false) : mkNumber("0", type);
+  return type.isBool() ? expr(false) : mkNumber("3", type);
 }
 
 expr expr::IntSMin(unsigned bits) {
@@ -1664,6 +1665,11 @@ expr expr::simplify() const {
   auto e = Z3_simplify(ctx(), ast());
   // Z3_simplify returns null on timeout
   return e ? e : *this;
+}
+
+expr expr::simplifyNoTimeout() const {
+  C();
+  return Z3_simplify_ex(ctx(), ast(), ctx.getNoTimeoutParam());
 }
 
 expr expr::subst(const vector<pair<expr, expr>> &repls) const {

@@ -16,6 +16,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 
 using namespace IR;
 using namespace smt;
@@ -241,25 +242,19 @@ static expr preprocess(Transform &t, const set<expr> &qvars0,
   if (hit_half_memory_limit())
     return expr::mkForAll(qvars0, move(e));
 
-  // TODO: benchmark
-  if (0) {
-    expr var = expr::mkBoolVar("malloc_never_fails");
-    e = expr::mkIf(var,
-                   e.subst(var, true).simplify(),
-                   e.subst(var, false).simplify());
-  }
-
   // eliminate all quantified boolean vars; Z3 gets too slow with those
   auto qvars = qvars0;
-  for (auto &var : qvars0) {
-    if (!var.isBool())
+  for (auto I = qvars.begin(); I != qvars.end(); ) {
+    auto &var = *I;
+    if (!var.isBool()) {
+      ++I;
       continue;
+    }
     if (hit_half_memory_limit())
       break;
 
-    e = e.subst(var, true).simplify() &&
-        e.subst(var, false).simplify();
-    qvars.erase(var);
+    e = (e.subst(var, true) && e.subst(var, false)).simplify();
+    I = qvars.erase(I);
   }
 
   if (config::disable_undef_input || undef_qvars.empty() ||
@@ -376,9 +371,10 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   expr axioms_expr = axioms();
   expr dom = dom_a && dom_b;
 
-  pre_tgt &= !tgt_state.sinkDomain();
+  auto sink_tgt = tgt_state.sinkDomain();
+  pre_tgt &= !sink_tgt;
 
-  expr pre_src_exists = pre_src, pre_src_forall = true;
+  expr pre_src_exists, pre_src_forall;
   {
     vector<pair<expr,expr>> repls;
     auto vars_pre = pre_src.vars();
@@ -386,11 +382,8 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
       if (vars_pre.count(v))
         repls.emplace_back(v, expr::mkFreshVar("#exists", v));
     }
-    auto new_pre = pre_src.subst(repls);
-    if (!new_pre.eq(pre_src)) {
-      pre_src_exists = move(new_pre);
-      pre_src_forall = pre_src;
-    }
+    pre_src_exists = pre_src.subst(repls);
+    pre_src_forall = pre_src_exists.eq(pre_src) ? true : pre_src;
   }
   expr pre = pre_src_exists && pre_tgt && src_state.getFnPre();
   pre_src_forall &= tgt_state.getFnPre();
@@ -406,6 +399,18 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   auto memory_cnstr = memory_cnstr0.isTrue() ? memory_cnstr0
                                              : value_cnstr && memory_cnstr0;
   qvars.insert(mem_undef.begin(), mem_undef.end());
+
+  if (src_state.sinkDomain().isTrue()) {
+    errs.add("The source program doesn't reach a return instruction.\n"
+             "Consider increasing the unroll factor if it has loops", false);
+    return;
+  }
+
+  if (sink_tgt.isTrue()) {
+    errs.add("The target program doesn't reach a return instruction.\n"
+             "Consider increasing the unroll factor if it has loops", false);
+    return;
+  }
 
   if (check_expr(axioms_expr && (pre_src && pre_tgt)).isUnsat()) {
     errs.add("Precondition is always false", false);
@@ -583,16 +588,22 @@ static unsigned returns_nonlocal(const Instr &inst,
 }
 
 
+static void initBitsProgramPointer(Transform &t) {
+  // FIXME: varies among address spaces
+  bits_program_pointer = t.src.bitsPointers();
+  assert(bits_program_pointer > 0 && bits_program_pointer <= 64);
+  assert(bits_program_pointer == t.tgt.bitsPointers());
+}
+
 static void calculateAndInitConstants(Transform &t) {
+  if (!bits_program_pointer)
+    initBitsProgramPointer(t);
+
   const auto &globals_tgt = t.tgt.getGlobalVars();
   const auto &globals_src = t.src.getGlobalVars();
   num_globals_src = globals_src.size();
   unsigned num_globals = num_globals_src;
 
-  // FIXME: varies among address spaces
-  bits_program_pointer = t.src.bitsPointers();
-  assert(bits_program_pointer > 0 && bits_program_pointer <= 64);
-  assert(bits_program_pointer == t.tgt.bitsPointers());
   heap_block_alignment = 8;
 
   num_consts_src = 0;
@@ -662,20 +673,24 @@ static void calculateAndInitConstants(Transform &t) {
 
     for (auto &v : fn->getInputs()) {
       auto *i = dynamic_cast<const Input *>(&v);
-      if (i && i->hasAttribute(ParamAttrs::Dereferenceable)) {
+      if (!i)
+        continue;
+
+      uint64_t align = i->getAttributes().align;
+      if (i->hasAttribute(ParamAttrs::Dereferenceable)) {
         does_mem_access = true;
         uint64_t deref_bytes = i->getAttributes().derefBytes;
-        min_access_size = gcd(min_access_size, deref_bytes);
+        min_access_size = gcd(min_access_size, gcd(deref_bytes, align));
         max_access_size = max(max_access_size, deref_bytes);
       }
-      if (i && i->hasAttribute(ParamAttrs::ByVal)) {
+      if (i->hasAttribute(ParamAttrs::ByVal)) {
         does_mem_access = true;
         auto sz = i->getAttributes().blockSize;
         max_access_size = max(max_access_size, sz);
         min_global_size = min_global_size != UINT64_MAX
                             ? gcd(sz, min_global_size)
                             : sz;
-        min_global_size = gcd(min_global_size, i->getAttributes().align);
+        min_global_size = gcd(min_global_size, align);
       }
     }
 
@@ -1084,8 +1099,11 @@ static map<string_view, Instr*> can_remove_init(Function &fn) {
         break;
       }
 
-      for (auto p = users.equal_range(user); p.first != p.second; ++p.first) {
-        worklist.emplace_back(p.first->second);
+      if (auto I = users.find(user);
+          I != users.end()) {
+        for (auto &[user, _] : I->second) {
+          worklist.emplace_back(user);
+        }
       }
     } while (!worklist.empty());
 
@@ -1185,6 +1203,12 @@ void Transform::preprocess() {
                                                 : src.getGlobalVarNames());
     } while (changed);
   }
+
+  // bits_program_pointer is used by unroll. Initialize it in advance
+  initBitsProgramPointer(*this);
+
+  src.unroll(config::src_unroll_cnt);
+  tgt.unroll(config::tgt_unroll_cnt);
 }
 
 void Transform::print(ostream &os, const TransformPrintOpts &opt) const {

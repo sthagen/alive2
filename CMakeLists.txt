@@ -29,6 +29,18 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+macro(remove_flags)
+  foreach(var ${ARGN})
+    string(REPLACE "${var}" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REPLACE "${var}" "" CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}")
+    string(REPLACE "${var}" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    string(REPLACE "${var}" "" CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
+    remove_definitions(${var})
+  endforeach()
+endmacro(remove_flags)
+
+remove_flags(-DNDEBUG)
+
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
 if (CYGWIN)
@@ -116,6 +128,9 @@ set(UTIL_SRCS
   util/config.cpp
   util/errors.cpp
   util/file.cpp
+  util/parallel.cpp
+  util/parallel_jobserver.cpp
+  util/parallel_unrestricted.cpp
   util/sort.cpp
   util/stopwatch.cpp
   util/symexec.cpp
@@ -175,23 +190,21 @@ if (BUILD_TV)
   endif()
   message(STATUS "Compiling translation validation plugin")
   add_subdirectory(tv)
+  set(FOR_ALIVE2_TEST 0)
   configure_file(
     ${CMAKE_SOURCE_DIR}/scripts/opt-alive.sh.in
-    ${CMAKE_BINARY_DIR}/scripts/opt-alive.sh
+    ${CMAKE_BINARY_DIR}/opt-alive.sh
     @ONLY
   )
+  set(FOR_ALIVE2_TEST 1)
   configure_file(
-    ${CMAKE_SOURCE_DIR}/scripts/alivecc.in
-    ${CMAKE_BINARY_DIR}/scripts/alivecc
+    ${CMAKE_SOURCE_DIR}/scripts/opt-alive.sh.in
+    ${CMAKE_BINARY_DIR}/opt-alive-test.sh
     @ONLY
   )
-  configure_file(
-    ${CMAKE_SOURCE_DIR}/scripts/alivecc.in
-    ${CMAKE_BINARY_DIR}/scripts/alive++
-    @ONLY
-  )
+  unset(FOR_ALIVE2_TEST)
 else()
-  message(STATUS "Skiping translation validation plugin")
+  message(STATUS "Skipping translation validation plugin")
 endif()
 
 add_executable(alive
@@ -201,11 +214,11 @@ add_executable(alive
               )
 target_link_libraries(alive PRIVATE ${ALIVE_LIBS})
 
-add_library(alive2 SHARED ${IR_SRCS} ${SMT_SRCS} ${TOOLS_SRCS} ${UTIL_SRCS} ${LLVM_UTIL_SRCS})
+#add_library(alive2 SHARED ${IR_SRCS} ${SMT_SRCS} ${TOOLS_SRCS} ${UTIL_SRCS} ${LLVM_UTIL_SRCS})
 
 if (BUILD_LLVM_UTILS OR BUILD_TV)
   llvm_map_components_to_libnames(llvm_libs support core irreader analysis passes transformutils)
-  target_link_libraries(alive2 PRIVATE ${llvm_libs})
+#  target_link_libraries(alive2 PRIVATE ${llvm_libs})
   target_link_libraries(alive-tv PRIVATE ${ALIVE_LIBS_LLVM} ${llvm_libs})
   target_link_libraries(alive-exec PRIVATE ${ALIVE_LIBS_LLVM} ${llvm_libs})
 endif()
@@ -218,7 +231,7 @@ if (CYGWIN)
   file(COPY "${Z3_LIBRARIES}" DESTINATION "${PROJECT_BINARY_DIR}")
 else()
   target_link_libraries(alive PRIVATE ${Z3_LIBRARIES})
-  target_link_libraries(alive2 PRIVATE ${Z3_LIBRARIES})
+  #target_link_libraries(alive2 PRIVATE ${Z3_LIBRARIES})
   if (BUILD_LLVM_UTILS OR BUILD_TV)
     target_link_libraries(alive-tv PRIVATE ${Z3_LIBRARIES})
     target_link_libraries(alive-exec PRIVATE ${Z3_LIBRARIES})
