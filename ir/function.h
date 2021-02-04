@@ -28,7 +28,6 @@ class BasicBlock final {
   std::vector<std::unique_ptr<Instr>> m_instrs;
 
 public:
-  BasicBlock(std::string &&name) : name(std::move(name)) {}
   BasicBlock(std::string_view name) : name(name) {}
 
   const std::string& getName() const { return name; }
@@ -63,9 +62,12 @@ class Function final {
   std::unordered_map<std::string, BasicBlock> BBs;
   std::vector<BasicBlock*> BB_order;
 
+  static BasicBlock sink_bb;
+
   unsigned bits_pointers = 64;
   unsigned bits_ptr_offset = 64;
   bool little_endian = true;
+  bool is_var_args = false;
 
   // constants used in this function
   std::vector<std::unique_ptr<Value>> constants;
@@ -79,12 +81,15 @@ class Function final {
 
   FnAttrs attrs;
 
+
 public:
   Function() {}
   Function(Type &type, std::string &&name, unsigned bits_pointers = 64,
-           unsigned bits_ptr_offset = 64, bool little_endian = true)
+           unsigned bits_ptr_offset = 64, bool little_endian = true,
+           bool is_var_args = false)
     : type(&type), name(std::move(name)), bits_pointers(bits_pointers),
-      bits_ptr_offset(bits_ptr_offset), little_endian(little_endian) {}
+      bits_ptr_offset(bits_ptr_offset), little_endian(little_endian),
+      is_var_args(is_var_args) {}
 
   const IR::Type& getType() const { return type ? *type : Type::voidTy; }
   void setType(IR::Type &t) { type = &t; }
@@ -92,15 +97,16 @@ public:
   const std::string& getName() const { return name; }
 
   auto& getFnAttrs() { return attrs; }
+  auto& getFnAttrs() const { return attrs; }
 
   smt::expr getTypeConstraints() const;
   void fixupTypes(const smt::Model &m);
 
   const BasicBlock& getFirstBB() const { return *BB_order[0]; }
   BasicBlock& getFirstBB() { return *BB_order[0]; }
+  const BasicBlock& getSinkBB() const { return sink_bb; }
   BasicBlock& getBB(std::string_view name, bool push_front = false);
   const BasicBlock& getBB(std::string_view name) const;
-  const BasicBlock* getBBIfExists(std::string_view name) const;
 
   void removeBB(BasicBlock &BB);
 
@@ -135,6 +141,7 @@ public:
   unsigned bitsPointers() const { return bits_pointers; }
   unsigned bitsPtrOffset() const { return bits_ptr_offset; }
   bool isLittleEndian() const { return little_endian; }
+  bool isVarArgs() const { return is_var_args; }
 
   void syncDataWithSrc(const Function &src);
 

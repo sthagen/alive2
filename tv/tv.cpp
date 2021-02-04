@@ -161,22 +161,28 @@ llvm::cl::opt<unsigned> opt_tgt_unrolling_factor(
     llvm::cl::desc("Unrolling factor for tgt function (default=0)"),
     llvm::cl::cat(TVOptions), llvm::cl::init(0));
 
-llvm::cl::opt<bool> parallel_tv_jobserver(
-    "tv-parallel-jobserver",
-    llvm::cl::desc("Distribute TV load across cores (requires GNU Make, "
-                   "please see README.md, default=false)"),
-    llvm::cl::cat(TVOptions), llvm::cl::init(false));
-
 llvm::cl::opt<bool> parallel_tv_unrestricted(
     "tv-parallel-unrestricted",
     llvm::cl::desc("Distribute TV load across cores without any throttling; "
                    "use this very carefully, if at all (default=false)"),
     llvm::cl::cat(TVOptions), llvm::cl::init(false));
 
+llvm::cl::opt<bool> parallel_tv_fifo(
+    "tv-parallel-fifo",
+    llvm::cl::desc("Distribute TV load across cores using Alive2's job "
+                   "server (please see README.md, default=false)"),
+    llvm::cl::cat(TVOptions), llvm::cl::init(false));
+
+llvm::cl::opt<bool> parallel_tv_null(
+    "tv-parallel-null",
+    llvm::cl::desc("Pretend to fork off child processes but don't really "
+                   "do it. For developer use only (default=false)"),
+    llvm::cl::cat(TVOptions), llvm::cl::init(false));
+
 llvm::cl::opt<int> max_subprocesses(
     "tv-max-subprocesses",
-    llvm::cl::desc("Maximum children this clang instance will have at any time "
-                   "(default=128)"),
+    llvm::cl::desc("Maximum children any single clang instance will have at one "
+                   "time (default=128)"),
     llvm::cl::cat(TVOptions), llvm::cl::init(128));
 
 llvm::cl::opt<long> subprocess_timeout(
@@ -204,14 +210,14 @@ unsigned initialized = 0;
 bool showed_stats = false;
 bool report_dir_created = false;
 bool has_failure = false;
+// If is_clangtv is true, tv should exit with zero
 bool is_clangtv = false;
 fs::path opt_report_parallel_dir;
 unique_ptr<parallel> parallelMgr;
 stringstream parent_ss;
 
 void sigalarm_handler(int) {
-  *out << "ERROR: Timeout\n\n";
-  parallelMgr->finishChild();
+  parallelMgr->finishChild(/*is_timeout=*/true);
   // this is a fully asynchronous exit, skip destructors and such
   _Exit(0);
 }
@@ -229,14 +235,21 @@ string get_random_str() {
   return to_string(rand(re));
 }
 
-struct TVPass final : public llvm::FunctionPass {
+struct TVPass final : public llvm::ModulePass {
   static char ID;
   bool skip_verify = false;
-  bool encode_io_fns_as_unknown = false;
+  const function<llvm::TargetLibraryInfo*(llvm::Function&)> *TLI_override
+    = nullptr;
 
-  TVPass() : FunctionPass(ID) {}
+  TVPass() : ModulePass(ID) {}
 
-  bool runOnFunction(llvm::Function &F) override {
+  bool runOnModule(llvm::Module &M) override {
+    for (auto &F: M)
+      runOnFunction(F);
+    return false;
+  }
+
+  bool runOnFunction(llvm::Function &F) {
     if (F.isDeclaration())
       // This can happen at EntryExitInstrumenter pass.
       return false;
@@ -244,20 +257,18 @@ struct TVPass final : public llvm::FunctionPass {
     if (!fnsToVerify.empty() && !fnsToVerify.count(F.getName().str()))
       return false;
 
-    ScopedWatch timer([&](const StopWatch &sw) {
-      fns_elapsed_time[F.getName().str()] += sw.seconds();
-    });
+    optional<ScopedWatch> timer;
+    if (opt_elapsed_time)
+      timer.emplace([&](const StopWatch &sw) {
+        fns_elapsed_time[F.getName().str()] += sw.seconds();
+      });
 
     llvm::TargetLibraryInfo *TLI = nullptr;
-    llvm::TargetLibraryInfoImpl TLIImpl;
-    unique_ptr<llvm::TargetLibraryInfo> TLI_holder;
-    if (is_clangtv) {
-      // When used as a clang plugin, this is run as a plain function rather
-      // than a registered pass, so getAnalysis() cannot be used.
-      TLIImpl = llvm::TargetLibraryInfoImpl(
-          llvm::Triple(F.getParent()->getTargetTriple()));
-      TLI_holder = make_unique<llvm::TargetLibraryInfo>(TLIImpl, &F);
-      TLI = TLI_holder.get();
+    if (TLI_override) {
+      // When used as a clang plugin or from the new pass manager, this is run
+      // as a plain function rather than a registered pass, so getAnalysis()
+      // cannot be used.
+      TLI = (*TLI_override)(F);
     } else {
       TLI = &getAnalysis<llvm::TargetLibraryInfoWrapperPass>().getTLI(F);
     }
@@ -302,19 +313,17 @@ struct TVPass final : public llvm::FunctionPass {
       out_file.flush();
       auto [pid, osp, index] = parallelMgr->limitedFork();
 
-      if (pid == -1)
-        llvm::report_fatal_error("fork() failed");
+      if (pid == -1) {
+        perror("fork() failed");
+        exit(-1);
+      }
 
       if (pid != 0) {
         /*
-         * parent returns to LLVM immediately. starting with the first
-         * time we reach this code, it writes its output to a
-         * stringstream that we'll patch up later to include output
-         * from children, before finally emitting it
+         * parent returns to LLVM immediately; leave a placeholder in
+         * the output that we'll patch up later
          */
-        out = &parent_ss;
         *out << "include(" << index << ")\n";
-        set_outs(*out);
         /*
          * TODO: this llvm2alive() call isn't needed for correctness,
          * but only to make parallel output match sequential
@@ -377,9 +386,10 @@ struct TVPass final : public llvm::FunctionPass {
 
   done:
     if (parallelMgr) {
+      signal(SIGALRM, SIG_IGN);
       llvm_util_init.reset();
       smt_init.reset();
-      parallelMgr->finishChild();
+      parallelMgr->finishChild(/*is_timeout=*/false);
       exit(0);
     }
     return false;
@@ -388,20 +398,6 @@ struct TVPass final : public llvm::FunctionPass {
   bool doInitialization(llvm::Module &module) override {
     if (initialized++)
       return false;
-
-    if (parallel_tv_jobserver) {
-      parallelMgr = make_unique<jobServer>();
-    } else if (parallel_tv_unrestricted) {
-      parallelMgr = make_unique<unrestricted>();
-    }
-
-    if (parallelMgr) {
-      if (!parallelMgr->init(max_subprocesses)) {
-        cerr << "WARNING: Parallel execution of Alive2 Clang plugin is "
-                "unavailable, sorry\n";
-        parallelMgr.reset();
-      }
-    }
 
     fnsToVerify.insert(opt_funcs.begin(), opt_funcs.end());
 
@@ -449,6 +445,39 @@ struct TVPass final : public llvm::FunctionPass {
       }
     }
 
+    auto &outstream = out_file.is_open() ? out_file : cerr;
+    if (parallel_tv_unrestricted) {
+      parallelMgr = make_unique<unrestricted>(max_subprocesses, parent_ss,
+                                              outstream);
+    }
+    if (parallel_tv_fifo) {
+      if (parallelMgr) {
+        cerr << "Alive2: Please specify only one parallel manager" << endl;
+        exit(1);
+      }
+      parallelMgr = make_unique<fifo>(max_subprocesses, parent_ss,
+                                      outstream);
+    }
+    if (parallel_tv_null) {
+      if (parallelMgr) {
+        cerr << "Alive2: Please specify only one parallel manager" << endl;
+        exit(1);
+      }
+      parallelMgr = make_unique<null>(max_subprocesses, parent_ss,
+                                      outstream);
+    }
+
+    if (parallelMgr) {
+      if (parallelMgr->init()) {
+        out = &parent_ss;
+        set_outs(*out);
+      } else {
+        cerr << "WARNING: Parallel execution of Alive2 Clang plugin is "
+                "unavailable, sorry\n";
+        parallelMgr.reset();
+      }
+    }
+
     showed_stats = false;
     smt::solver_print_queries(opt_smt_verbose);
     smt::solver_tactic_verbose(opt_tactic_verbose);
@@ -472,8 +501,9 @@ struct TVPass final : public llvm::FunctionPass {
 
   bool doFinalization(llvm::Module&) override {
     if (parallelMgr) {
-      parallelMgr->waitForAllChildren();
-      parallelMgr->emitOutput(parent_ss, out_file);
+      parallelMgr->finishParent();
+      out = out_file.is_open() ? &out_file : &cerr;
+      set_outs(*out);
     }
 
     if (!showed_stats) {
@@ -523,9 +553,9 @@ llvm::RegisterPass<TVPass> X("tv", "Translation Validator", false, false);
 
 
 
-#ifdef CLANG_PLUGIN
-/// Classes and functions for running translation validation on clang
-/// Uses new pass manager's callback.
+/// Classes and functions for running translation validation on clang or
+/// opt with new pass manager
+/// Clang plugin uses new pass manager's callback.
 
 struct TVInitPass : public llvm::PassInfoMixin<TVInitPass> {
   llvm::PreservedAnalyses run(llvm::Module &M,
@@ -537,12 +567,16 @@ struct TVInitPass : public llvm::PassInfoMixin<TVInitPass> {
 
 struct TVFinalizePass : public llvm::PassInfoMixin<TVFinalizePass> {
   static bool finalized;
-  llvm::PreservedAnalyses run(llvm::Function &F,
-                              llvm::FunctionAnalysisManager &FAM) {
+  static void finalize(llvm::Module &M) {
     if (!finalized) {
       finalized = true;
-      TVPass().doFinalization(*F.getParent());
+      TVPass().doFinalization(M);
     }
+  }
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &MAM) {
+    finalize(M);
     return llvm::PreservedAnalyses::all();
   }
 };
@@ -568,9 +602,10 @@ const llvm::Module * unwrapModule(llvm::Any IR) {
   llvm_unreachable("Unknown IR unit");
 }
 
+
 const char* skip_pass_list[] = {
   "{anonymous}::TVInitPass",
-  "ModuleToFunctionPassAdaptor<{anonymous}::TVFinalizePass>",
+  "{anonymous}::TVFinalizePass",
   "ArgumentPromotionPass",
   "DeadArgumentEliminationPass",
   "EliminateAvailableExternallyPass",
@@ -591,6 +626,71 @@ bool do_skip(const llvm::StringRef &pass0) {
                 [&](auto skip) { return pass == skip; });
 }
 
+struct TVNewPass : public llvm::PassInfoMixin<TVNewPass> {
+  static bool skip_tv;
+  static string pass_name;
+  // The number of TVNewPass created.
+  static unsigned num_tv_pass_created;
+  bool print_pass_name = false;
+
+
+  llvm::PreservedAnalyses run(llvm::Module &M,
+                              llvm::ModuleAnalysisManager &AM) {
+    auto &FAM = AM.getResult<llvm::FunctionAnalysisManagerModuleProxy>(M)
+                  .getManager();
+    auto get_TLI = [&FAM](llvm::Function &F) {
+      return &FAM.getResult<llvm::TargetLibraryAnalysis>(F);
+    };
+    run(M, get_TLI);
+    return llvm::PreservedAnalyses::all();
+  }
+
+  void run(llvm::Module &M,
+           const function<llvm::TargetLibraryInfo*(llvm::Function&)> &get_TLI) {
+    // Check TVFinalizePass::finalized again because TVNewPass can be
+    // called after TVFinalizePass registered by
+    // registerOptimizerLastEPCallback.
+    // It can happen when a default pipeline (O3, O2, ...) is used.
+    if (TVFinalizePass::finalized)
+      return;
+
+    static unsigned count = 0;
+    if (!out) {
+      // TVInitPass is not called yet.
+      // This can happen at very early passes, such as
+      // ForceFunctionAttrsPass.
+      skip_tv = false;
+      return;
+    }
+
+    ++count;
+    if (print_pass_name) {
+      // print_pass_name is set only when running clang tv
+      *out << "-- " << count << ". " << pass_name
+           << (skip_tv ? " : Skipping\n" : "\n");
+    }
+
+    TVPass tv;
+    tv.skip_verify = skip_tv;
+
+    tv.TLI_override = &get_TLI;
+    // If skip_pass is true, this updates fns map only.
+    tv.runOnModule(M);
+
+    skip_tv = false;
+    if (count == num_tv_pass_created) {
+      // If it is clang tv, num_tv_pass_created should be zero.
+      assert(!is_clangtv);
+      TVFinalizePass::finalize(M);
+    }
+  }
+};
+
+bool TVNewPass::skip_tv = false;
+string TVNewPass::pass_name;
+unsigned TVNewPass::num_tv_pass_created = 0;
+
+
 // Entry point for this plugin
 extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
@@ -598,6 +698,32 @@ llvmGetPassPluginInfo() {
     LLVM_PLUGIN_API_VERSION, "Alive2 Translation Validation", "",
     [](llvm::PassBuilder &PB) {
       is_clangtv = true;
+      PB.registerPipelineParsingCallback(
+          [](llvm::StringRef Name,
+             llvm::ModulePassManager &MPM,
+             llvm::ArrayRef<llvm::PassBuilder::PipelineElement>) {
+          static bool first_tv = true;
+          if (Name != "tv")
+            return false;
+
+          if (first_tv) {
+            // Assume that this plugin is loaded from opt when tv pass is
+            // explicitly given as an argument
+            is_clangtv = false;
+            first_tv = false;
+            MPM.addPass(TVInitPass());
+          }
+          MPM.addPass(TVNewPass());
+          // Finalization is done by the last TVNewPass
+          TVNewPass::num_tv_pass_created++;
+          return true;
+        });
+      // These two register*EPCallbacks are called when 'default' pipelines
+      // such as O2, O3 are used by either opt or clang.
+      // For clang -O2, these are needed. For opt, these are currently redundant
+      // because we don't support e.g. opt -passes="tv,default<O2>,tv".
+      // But there is no way to distinguish which one (clang vs. opt) is invoked
+      // so simply always add these.
       PB.registerPipelineStartEPCallback(
           [](llvm::ModulePassManager &MPM,
              llvm::PassBuilder::OptimizationLevel) {
@@ -606,41 +732,37 @@ llvmGetPassPluginInfo() {
       PB.registerOptimizerLastEPCallback(
           [](llvm::ModulePassManager &MPM,
              llvm::PassBuilder::OptimizationLevel) {
-            MPM.addPass(createModuleToFunctionPassAdaptor(TVFinalizePass()));
+            MPM.addPass(TVFinalizePass());
           });
       auto f = [](llvm::StringRef P, llvm::Any IR,
                   const llvm::PreservedAnalyses &PA) {
-        static int count = 0;
-        if (!out) {
-          // TVInitPass is not called yet.
-          // This can happen at very early passes, such as
-          // ForceFunctionAttrsPass.
-          return;
-        }
-
         if (TVFinalizePass::finalized)
           return;
 
-        bool skip_pass = do_skip(P);
-        *out << "-- " << ++count << ". " << P.str()
-             << (skip_pass ? " : Skipping\n" : "\n");
+        TVNewPass::pass_name = P.str();
+        TVNewPass::skip_tv |= do_skip(TVNewPass::pass_name);
 
-        TVPass tv;
-        tv.skip_verify = skip_pass;
-        // For I/O known calls like printf, it is fine to regard them as valid
-        // 'unknown calls' except when it is InstCombine.
-        tv.encode_io_fns_as_unknown = P != "InstCombinePass" &&
-                                      P != "AggressiveInstCombinePass";
+        if (!is_clangtv)
+          return;
 
-        auto M = const_cast<llvm::Module *>(unwrapModule(IR));
-        for (auto &F: *M)
-          // If skip_pass is true, this updates fns map only.
-          tv.runOnFunction(F);
+        // If it is clang tv, validate each pass
+        TVNewPass tv;
+        tv.print_pass_name = true;
+
+        static optional<llvm::TargetLibraryInfoImpl> TLIImpl;
+        optional<llvm::TargetLibraryInfo> TLI_holder;
+
+        auto get_TLI = [&](llvm::Function &F) {
+          if (!TLIImpl)
+            TLIImpl.emplace(llvm::Triple(F.getParent()->getTargetTriple()));
+          return &TLI_holder.emplace(*TLIImpl, &F);
+        };
+
+        tv.run(*const_cast<llvm::Module *>(unwrapModule(IR)), get_TLI);
       };
       PB.getPassInstrumentationCallbacks()->registerAfterPassCallback(move(f));
     }
   };
 }
-#endif
 
 }

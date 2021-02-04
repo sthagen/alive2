@@ -109,6 +109,8 @@ ostream& operator<<(ostream &os, const BasicBlock &bb) {
 }
 
 
+BasicBlock Function::sink_bb("#sink");
+
 expr Function::getTypeConstraints() const {
   expr t(true);
   for (auto bb : getBBs()) {
@@ -134,6 +136,7 @@ void Function::fixupTypes(const Model &m) {
 }
 
 BasicBlock& Function::getBB(string_view name, bool push_front) {
+  assert(name != "#sink");
   auto p = BBs.try_emplace(string(name), name);
   if (p.second) {
     if (push_front)
@@ -145,15 +148,12 @@ BasicBlock& Function::getBB(string_view name, bool push_front) {
 }
 
 const BasicBlock& Function::getBB(string_view name) const {
+  assert(name != "#sink");
   return BBs.at(string(name));
 }
 
-const BasicBlock* Function::getBBIfExists(string_view name) const {
-  auto I = BBs.find(string(name));
-  return I != BBs.end() ? &I->second : nullptr;
-}
-
 void Function::removeBB(BasicBlock &BB) {
+  assert(BB.getName() != "#sink");
   BBs.erase(BB.getName());
 
   for (auto I = BB_order.begin(), E = BB_order.end(); I != E; ++I) {
@@ -219,14 +219,11 @@ bool Function::hasSameInputs(const Function &rhs) const {
   while (litr != lend && ritr != rend) {
     auto *lv = dynamic_cast<Input *>((*litr).get());
     auto *rv = dynamic_cast<Input *>((*ritr).get());
-    // TODO: &lv->getType() != &rv->getType() doesn't work because
-    // two struct types that are structurally equivalent don't compare equal
-    if (lv->getAttributes() != rv->getAttributes()) {
+    if (lv->getType().toString() != rv->getType().toString())
       return false;
-    }
 
-    litr++;
-    ritr++;
+    ++litr;
+    ++ritr;
     skip_constinputs();
   }
 
@@ -469,7 +466,7 @@ void Function::unroll(unsigned k) {
     return;
 
   auto &forest = la.getLoopForest();
-  BasicBlock &sink = getBB("#sink");
+  auto &sink = getSinkBB();
 
   vector<tuple<BasicBlock*, unsigned, bool>> worklist;
   // insert in reverse order because the worklist is iterated in LIFO
@@ -486,9 +483,9 @@ void Function::unroll(unsigned k) {
 
   // traverse each loop tree in post-order
   while (!worklist.empty()) {
-    auto &[header, height, flag] = worklist.back();
+    auto [header, height, flag] = worklist.back();
     if (!flag) {
-      flag = true;
+      get<2>(worklist.back()) = flag = true;
       auto I = forest.find(header);
       if (I != forest.end()) {
         // process all non-leaf children first
@@ -757,7 +754,7 @@ void Function::print(ostream &os, bool print_header) const {
   }
 
   if (print_header) {
-    os << "define" << attrs << ' ' << getType() << " @" << name << '(';
+    os << "define " << getType() << " @" << name << '(';
     bool first = true;
     for (auto &input : getInputs()) {
       if (!first)
@@ -765,7 +762,9 @@ void Function::print(ostream &os, bool print_header) const {
       os << input;
       first = false;
     }
-    os << ") {\n";
+    if (isVarArgs())
+      os << (first ? "..." : ", ...");
+    os << ')' << attrs << " {\n";
   }
 
   bool first = true;
@@ -867,10 +866,11 @@ void CFG::printDot(ostream &os) const {
 // traverse the cfg in reverse postorder to build dominators.
 void DomTree::buildDominators(const CFG &cfg) {
   // initialization
-  unsigned i = f.getBBs().size();
+  unsigned i = f.getBBs().size() + 1;
   for (auto &b : f.getBBs()) {
     doms.emplace(b, *b).first->second.order = --i;
   }
+  doms.emplace(&f.getSinkBB(), f.getSinkBB()).first->second.order = 0;
 
   // build predecessors relationship
   for (auto [src, tgt, instr] : cfg) {
@@ -964,8 +964,8 @@ void LoopAnalysis::getDepthFirstSpanningTree() {
   while(!worklist.empty()) {
     auto &[bb, flag] = worklist.back();
     if (flag) {
-      worklist.pop_back();
       last[number[bb]] = current - 1;
+      worklist.pop_back();
     } else {
       node[current] = bb;
       number[bb] = current++;

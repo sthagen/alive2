@@ -74,7 +74,8 @@ public:
 class UnaryOp final : public Instr {
 public:
   enum Op {
-    Copy, BitReverse, BSwap, Ctpop, IsConstant, FNeg, FFS, FAbs
+    Copy, BitReverse, BSwap, Ctpop, IsConstant, FAbs, FNeg,
+    Ceil, Floor, Round, RoundEven, Trunc, Sqrt, FFS
   };
 
 private:
@@ -322,8 +323,6 @@ public:
     const BasicBlock& operator*() const;
     target_iterator& operator++(void) { ++idx; return *this; }
     bool operator==(const target_iterator &rhs) const { return idx == rhs.idx; }
-    // FIXME: remove when we drop g++9 support
-    bool operator!=(const target_iterator &rhs) const { return idx != rhs.idx; }
   };
 
   class it_helper {
@@ -785,12 +784,12 @@ private:
   std::string fnName;
   std::vector<std::pair<Value*, ParamAttrs>> args;
   FnAttrs attrs;
-  bool valid;
+  bool approx;
 public:
   FnCall(Type &type, std::string &&name, std::string &&fnName,
-         FnAttrs &&attrs = FnAttrs::None, bool valid = true)
+         FnAttrs &&attrs = FnAttrs::None, bool approx = false)
     : MemInstr(type, std::move(name)), fnName(std::move(fnName)),
-      attrs(std::move(attrs)), valid(valid) {}
+      attrs(std::move(attrs)), approx(approx) {}
   void addArg(Value &arg, ParamAttrs &&attrs);
   const auto& getFnName() const { return fnName; }
   const auto& getArgs() const { return args; }
@@ -812,11 +811,65 @@ public:
 };
 
 
+class VaStart final : public Instr {
+  Value *ptr;
+public:
+  VaStart(Value &ptr) : Instr(Type::voidTy, "va_start"), ptr(&ptr) {}
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
+class VaEnd final : public Instr {
+  Value *ptr;
+public:
+  VaEnd(Value &ptr) : Instr(Type::voidTy, "va_end"), ptr(&ptr) {}
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
+class VaCopy final : public Instr {
+  Value *dst, *src;
+public:
+  VaCopy(Value &dst, Value &src)
+    : Instr(Type::voidTy, "va_copy"), dst(&dst), src(&src) {}
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
+class VaArg final : public Instr {
+  Value *ptr;
+public:
+  VaArg(Type &type, std::string &&name, Value &ptr)
+    : Instr(type, std::move(name)), ptr(&ptr) {}
+  std::vector<Value*> operands() const override;
+  void rauw(const Value &what, Value &with) override;
+  void print(std::ostream &os) const override;
+  StateValue toSMT(State &s) const override;
+  smt::expr getTypeConstraints(const Function &f) const override;
+  std::unique_ptr<Instr> dup(const std::string &suffix) const override;
+};
+
+
 class ExtractElement final : public Instr {
   Value *v, *idx;
 public:
   ExtractElement(Type &type, std::string &&name, Value &v, Value &idx)
-    : Instr(type, move(name)), v(&v), idx(&idx) {}
+    : Instr(type, std::move(name)), v(&v), idx(&idx) {}
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -830,7 +883,7 @@ class InsertElement final : public Instr {
   Value *v, *e, *idx;
 public:
   InsertElement(Type &type, std::string &&name, Value &v, Value &e, Value &idx)
-    : Instr(type, move(name)), v(&v), e(&e), idx(&idx) {}
+    : Instr(type, std::move(name)), v(&v), e(&e), idx(&idx) {}
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;
@@ -846,7 +899,7 @@ class ShuffleVector final : public Instr {
 public:
   ShuffleVector(Type &type, std::string &&name, Value &v1, Value &v2,
                 std::vector<unsigned> mask)
-    : Instr(type, move(name)), v1(&v1), v2(&v2), mask(std::move(mask)) {}
+    : Instr(type, std::move(name)), v1(&v1), v2(&v2), mask(std::move(mask)) {}
   std::vector<Value*> operands() const override;
   void rauw(const Value &what, Value &with) override;
   void print(std::ostream &os) const override;

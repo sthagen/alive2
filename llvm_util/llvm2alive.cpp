@@ -244,7 +244,7 @@ public:
     RETURN_IDENTIFIER(make_unique<Freeze>(*ty, value_name(i), *val));
   }
 
-  RetTy visitCallInst(llvm::CallInst &i) {
+  RetTy visitCallInst(llvm::CallInst &i, bool approx = false) {
     vector<Value *> args;
     for (auto &arg : i.args()) {
       auto a = get_operand(arg);
@@ -253,9 +253,18 @@ public:
       args.emplace_back(a);
     }
 
-    auto [call_val, attrs, param_attrs, valid] = known_call(i, TLI, *BB, args);
-    if (call_val)
-      RETURN_IDENTIFIER(move(call_val));
+    FnAttrs attrs;
+    vector<ParamAttrs> param_attrs;
+    if (!approx) {
+      // call_val, attrs, param_attrs, approx
+      auto known = known_call(i, TLI, *BB, args);
+      if (get<0>(known))
+        RETURN_IDENTIFIER(move(get<0>(known)));
+
+      attrs       = move(get<1>(known));
+      param_attrs = move(get<2>(known));
+      approx      = get<3>(known);
+    }
 
     auto fn = i.getCalledFunction();
     if (!fn) // TODO: support indirect calls
@@ -303,12 +312,8 @@ public:
 
     auto call = make_unique<FnCall>(*ty, value_name(i),
                                     '@' + fn->getName().str(), move(attrs),
-                                    valid);
+                                    approx);
     unique_ptr<Instr> ret_val;
-
-    // avoid parsing arguments altogether for "unknown known" functions
-    if (!valid)
-      goto end;
 
     for (uint64_t argidx = 0, nargs = i.arg_size(); argidx < nargs; ++argidx) {
       auto *arg = args[argidx];
@@ -376,7 +381,7 @@ public:
       if (i.paramHasAttr(argidx, llvm::Attribute::Returned)) {
         auto call2
           = make_unique<FnCall>(Type::voidTy, "", string(call->getFnName()),
-                                FnAttrs(call->getAttributes()), valid);
+                                FnAttrs(call->getAttributes()), approx);
         for (auto &[arg, flags] : call->getArgs()) {
           call2->addArg(*arg, ParamAttrs(flags));
         }
@@ -399,7 +404,6 @@ public:
       BB->addInstr(move(call));
       RETURN_IDENTIFIER(move(ret_val));
     }
-end:
     RETURN_IDENTIFIER(move(call));
   }
 
@@ -616,7 +620,8 @@ end:
         continue;
       }
 
-      gep->addIdx(DL().getTypeAllocSize(I.getIndexedType()), *op);
+      gep->addIdx(DL().getTypeAllocSize(I.getIndexedType()).getKnownMinValue(),
+                  *op);
     }
     RETURN_IDENTIFIER(move(gep));
   }
@@ -775,22 +780,34 @@ end:
     }
     case llvm::Intrinsic::bitreverse:
     case llvm::Intrinsic::bswap:
+    case llvm::Intrinsic::ceil:
     case llvm::Intrinsic::ctpop:
     case llvm::Intrinsic::expect:
     case llvm::Intrinsic::expect_with_probability:
+    case llvm::Intrinsic::fabs:
+    case llvm::Intrinsic::floor:
     case llvm::Intrinsic::is_constant:
-    case llvm::Intrinsic::fabs: {
+    case llvm::Intrinsic::round:
+    case llvm::Intrinsic::roundeven:
+    case llvm::Intrinsic::sqrt:
+    case llvm::Intrinsic::trunc: {
       PARSE_UNOP();
       UnaryOp::Op op;
       switch (i.getIntrinsicID()) {
-      case llvm::Intrinsic::bitreverse: op = UnaryOp::BitReverse; break;
-      case llvm::Intrinsic::bswap:      op = UnaryOp::BSwap; break;
-      case llvm::Intrinsic::ctpop:      op = UnaryOp::Ctpop; break;
+      case llvm::Intrinsic::bitreverse:  op = UnaryOp::BitReverse; break;
+      case llvm::Intrinsic::bswap:       op = UnaryOp::BSwap; break;
+      case llvm::Intrinsic::ceil:        op = UnaryOp::Ceil; break;
+      case llvm::Intrinsic::ctpop:       op = UnaryOp::Ctpop; break;
       case llvm::Intrinsic::expect:
       case llvm::Intrinsic::expect_with_probability:
         op = UnaryOp::Copy; break;
-      case llvm::Intrinsic::is_constant: op = UnaryOp::IsConstant; break;
       case llvm::Intrinsic::fabs:        op = UnaryOp::FAbs; break;
+      case llvm::Intrinsic::floor:       op = UnaryOp::Floor; break;
+      case llvm::Intrinsic::is_constant: op = UnaryOp::IsConstant; break;
+      case llvm::Intrinsic::round:       op = UnaryOp::Round; break;
+      case llvm::Intrinsic::roundeven:   op = UnaryOp::RoundEven; break;
+      case llvm::Intrinsic::sqrt:        op = UnaryOp::Sqrt; break;
+      case llvm::Intrinsic::trunc:       op = UnaryOp::Trunc; break;
       default: UNREACHABLE();
       }
       RETURN_IDENTIFIER(make_unique<UnaryOp>(*ty, value_name(i), *val, op,
@@ -819,7 +836,8 @@ end:
       case llvm::Intrinsic::vector_reduce_umin: op = UnaryReductionOp::UMin; break;
       default: UNREACHABLE();
       }
-      RETURN_IDENTIFIER(make_unique<UnaryReductionOp>(*ty, value_name(i), *val, op));
+      RETURN_IDENTIFIER(
+        make_unique<UnaryReductionOp>(*ty, value_name(i), *val, op));
     }
     case llvm::Intrinsic::fshl:
     case llvm::Intrinsic::fshr:
@@ -869,6 +887,26 @@ end:
         return error(i);
       RETURN_IDENTIFIER(make_unique<Free>(*b, false));
     }
+    case llvm::Intrinsic::trap:
+    {
+      FnAttrs attrs;
+      attrs.set(FnAttrs::NoReturn);
+      attrs.set(FnAttrs::NoWrite);
+      return make_unique<FnCall>(*llvm_type2alive(i.getType()),
+                                 "", "#trap", move(attrs));
+    }
+    case llvm::Intrinsic::vastart: {
+      PARSE_UNOP();
+      return make_unique<VaStart>(*val);
+    }
+    case llvm::Intrinsic::vaend: {
+      PARSE_UNOP();
+      return make_unique<VaEnd>(*val);
+    }
+    case llvm::Intrinsic::vacopy: {
+      PARSE_BINOP();
+      return make_unique<VaCopy>(*a, *b);
+    }
 
     // do nothing intrinsics
     case llvm::Intrinsic::dbg_addr:
@@ -879,12 +917,13 @@ end:
     case llvm::Intrinsic::instrprof_increment:
     case llvm::Intrinsic::instrprof_increment_step:
     case llvm::Intrinsic::instrprof_value_profile:
+    case llvm::Intrinsic::prefetch:
       return NOP(i);
 
     default:
       break;
     }
-    return error(i);
+    return visitCallInst(i, true);
   }
 
   RetTy visitExtractElementInst(llvm::ExtractElementInst &i) {
@@ -905,6 +944,11 @@ end:
       mask.push_back(m);
     RETURN_IDENTIFIER(make_unique<ShuffleVector>(*ty, value_name(i), *a, *b,
                                                  move(mask)));
+  }
+
+  RetTy visitVAArg(llvm::VAArgInst &i) {
+    PARSE_UNOP();
+    RETURN_IDENTIFIER(make_unique<VaArg>(*ty, value_name(i), *val));
   }
 
   RetTy visitInstruction(llvm::Instruction &i) { return error(i); }
@@ -1070,7 +1114,8 @@ end:
       return {};
 
     Function Fn(*type, f.getName().str(), 8 * DL().getPointerSize(),
-                DL().getIndexSizeInBits(0), DL().isLittleEndian());
+                DL().getIndexSizeInBits(0), DL().isLittleEndian(),
+                f.isVarArg());
     reset_state(Fn);
 
     for (auto &arg : f.args()) {

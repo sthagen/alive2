@@ -4,6 +4,7 @@
 // Distributed under the MIT license that can be found in the LICENSE file.
 
 #include <ostream>
+#include <poll.h>
 #include <sstream>
 #include <sys/types.h>
 #include <tuple>
@@ -24,74 +25,97 @@ struct childProcess {
 
 class parallel {
   pid_t parent_pid = -1;
-  int max_subprocesses;
+  int max_active_children;
+  int fd_to_parent;
+  int active_children = 0;
+  std::vector<pollfd> pfd;
+  std::vector<int> pfd_map;
+  std::vector<childProcess> children;
+  std::stringstream &parent_ss;
+  std::ostream &out_file;
   void ensureParent();
   void ensureChild();
-  int subprocesses = 0;
-  /*
-   * TODO JDR: this may work better as an unordered_map, I'll
-   * investigate this later on
-   */
-  std::vector<childProcess> children;
-
-protected:
-  void writeToParent();
-  bool readFromChildren();
-  std::tuple<pid_t, std::ostream *, int> doFork();
+  void reapZombies();
+  bool emitOutput();
+  bool readFromChildren(bool blocking);
 
 public:
+  parallel(int max_active_children, std::stringstream &parent_ss,
+           std::ostream &out_file)
+      : max_active_children(max_active_children), parent_ss(parent_ss),
+        out_file(out_file) {}
   virtual ~parallel() {}
 
   /*
    * must be called before any other methods are used, and this object
    * must not be subsequently used if init() returns false
    */
-  virtual bool init(int _max_subprocesses);
+  virtual bool init();
+
+  virtual void getToken() = 0;
+  virtual void putToken() = 0;
 
   /*
    * called from parent; like fork(), returns non-zero to parent and
    * zero to child. it may also return -1 in which case there is no
    * child process and the other two returned values are meaningless.
    * this does not fork until max_processes is respected and,
-   * additionally, may throttle the child using e.g. the POSIX
-   * jobserver. the returned ostream is for the child to write its
-   * results into and the integer is a unique identifier for this
-   * child process.
+   * additionally, may throttle the child. the returned ostream is for
+   * the child to write its results into and the integer is a unique
+   * identifier for this child process.
    */
   virtual std::tuple<pid_t, std::ostream *, int> limitedFork() = 0;
 
   /*
    * called from a child that has finished executing
    */
-  virtual void finishChild() = 0;
+  virtual void finishChild(bool is_timeout) = 0;
 
   /*
    * called from parent, returns when all child processes have
    * terminated
    */
-  virtual void waitForAllChildren();
-
-  void emitOutput(std::stringstream &parent_ss, std::ofstream &out_file);
+  virtual void finishParent() = 0;
 };
 
-class jobServer final : public parallel {
+class fifo final : public parallel {
   char token;
-  int read_fd = -1, write_fd = -1;
-  bool nonblocking = false;
-  void getToken();
-  void putToken();
+  int pipe_fd = -1;
 
 public:
-  bool init(int max_subprocesses) override;
+  fifo(int max_active_children, std::stringstream &parent_ss,
+       std::ostream &out_file)
+      : parallel(max_active_children, parent_ss, out_file) {}
+  bool init() override;
   std::tuple<pid_t, std::ostream *, int> limitedFork() override;
-  void finishChild() override;
-  void waitForAllChildren() override;
+  void finishChild(bool is_timeout) override;
+  void finishParent() override;
+  void getToken() override;
+  void putToken() override;
 };
 
 class unrestricted final : public parallel {
 public:
-  bool init(int max_subprocesses) override;
+  unrestricted(int max_active_children, std::stringstream &parent_ss,
+               std::ostream &out_file)
+      : parallel(max_active_children, parent_ss, out_file) {}
+  bool init() override;
   std::tuple<pid_t, std::ostream *, int> limitedFork() override;
-  void finishChild() override;
-  void waitForAllChildren() override;
+  void finishChild(bool is_timeout) override;
+  void finishParent() override;
+  void getToken() override;
+  void putToken() override;
+};
+
+class null final : public parallel {
+public:
+  null(int max_active_children, std::stringstream &parent_ss,
+       std::ostream &out_file)
+      : parallel(max_active_children, parent_ss, out_file) {}
+  bool init() override;
+  std::tuple<pid_t, std::ostream *, int> limitedFork() override;
+  void finishChild(bool is_timeout) override;
+  void finishParent() override;
+  void getToken() override;
+  void putToken() override;
 };

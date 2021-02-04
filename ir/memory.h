@@ -3,11 +3,13 @@
 // Copyright (c) 2018-present The Alive2 Authors.
 // Distributed under the MIT license that can be found in the LICENSE file.
 
-#include "ir/globals.h"
+#include "ir/pointer.h"
 #include "ir/state_value.h"
 #include "ir/type.h"
 #include "smt/expr.h"
 #include "smt/exprs.h"
+#include "util/spaceship.h"
+#include <compare>
 #include <map>
 #include <optional>
 #include <ostream>
@@ -20,7 +22,6 @@ namespace smt { class Model; }
 namespace IR {
 
 class Memory;
-class Pointer;
 class State;
 
 
@@ -47,11 +48,11 @@ public:
 
   // Creates a pointer byte that represents i'th byte of p.
   // non_poison should be an one-bit vector or boolean.
-  Byte(const Pointer &ptr, unsigned i, const smt::expr &non_poison);
+  Byte(const Memory &m, const StateValue &ptr, unsigned i);
 
-  // Creates a non-pointer byte that has data and non_poison.
-  // data and non_poison should have bits_byte bits.
-  Byte(const Memory &m, const smt::expr &data, const smt::expr &non_poison);
+  Byte(const Memory &m, const StateValue &v);
+
+  static Byte mkPoisonByte(const Memory &m);
 
   smt::expr isPtr() const;
   smt::expr ptrNonpoison() const;
@@ -63,7 +64,9 @@ public:
   smt::expr isPoison(bool fullbit = true) const;
   smt::expr isZero() const; // zero or null
 
-  const smt::expr& operator()() const { return p; }
+  smt::expr&& operator()() && { return std::move(p); }
+
+  smt::expr refined(const Byte &other) const;
 
   smt::expr operator==(const Byte &rhs) const {
     return p == rhs.p;
@@ -75,128 +78,7 @@ public:
 
   static unsigned bitsByte();
 
-  static Byte mkPtrByte(const Memory &m, const smt::expr &val);
-  static Byte mkNonPtrByte(const Memory &m, const smt::expr &val);
-  static Byte mkPoisonByte(const Memory &m);
   friend std::ostream& operator<<(std::ostream &os, const Byte &byte);
-};
-
-
-class Pointer {
-  const Memory &m;
-
-  // [bid, offset, attributes (1 bit for each)]
-  // The top bit of bid is 1 if the block is local, 0 otherwise.
-  // A local memory block is a memory block that is
-  // allocated by an instruction during the current function call. This does
-  // not include allocated blocks from a nested function call. A heap-allocated
-  // block can also be a local memory block.
-  // Otherwise, a pointer is pointing to a non-local block, which can be either
-  // of global variable, heap, or a stackframe that is not this function call.
-  // The lowest bits represent whether the pointer value came from a nocapture/
-  // readonly argument. If block is local, is-readonly or is-nocapture cannot
-  // be 1.
-  // TODO: missing support for address space
-  smt::expr p;
-
-  smt::expr getValue(const char *name, const smt::FunctionExpr &local_fn,
-                      const smt::FunctionExpr &nonlocal_fn,
-                      const smt::expr &ret_type, bool src_name = false) const;
-
-public:
-  Pointer(const Memory &m, const char *var_name,
-          const smt::expr &local = false, bool unique_name = true,
-          bool align = true, const smt::expr &attr = smt::expr());
-  Pointer(const Memory &m, smt::expr p);
-  Pointer(const Memory &m, unsigned bid, bool local);
-  Pointer(const Memory &m, unsigned bid, bool local, const smt::expr &offset);
-  Pointer(const Memory &m, const smt::expr &bid, const smt::expr &offset,
-          const smt::expr &attrs = smt::expr());
-
-  static unsigned totalBits();
-  static unsigned totalBitsShort();
-  static unsigned bitsShortOffset();
-
-  smt::expr isLocal(bool simplify = true) const;
-
-  smt::expr getBid() const;
-  smt::expr getShortBid() const; // same as getBid but ignoring is_local bit
-  smt::expr getOffset() const;
-  smt::expr getOffsetSizet() const;
-  smt::expr getShortOffset() const; // same as getOffset but skips aligned bits
-  smt::expr getAttrs() const;
-  smt::expr getAddress(bool simplify = true) const;
-
-  smt::expr blockSize() const;
-
-  const smt::expr& operator()() const { return p; }
-  // Returns expr with short_bid+offset. It strips attrs away.
-  // If this pointer is constructed with var_name (has_attr with false),
-  // the returned expr is the variable.
-  smt::expr shortPtr() const;
-  smt::expr release() { return std::move(p); }
-  unsigned bits() const { return p.bits(); }
-
-  Pointer operator+(unsigned) const;
-  Pointer operator+(const smt::expr &bytes) const;
-  void operator+=(const smt::expr &bytes);
-
-  smt::expr addNoOverflow(const smt::expr &offset) const;
-
-  smt::expr operator==(const Pointer &rhs) const;
-  smt::expr operator!=(const Pointer &rhs) const;
-
-  StateValue sle(const Pointer &rhs) const;
-  StateValue slt(const Pointer &rhs) const;
-  StateValue sge(const Pointer &rhs) const;
-  StateValue sgt(const Pointer &rhs) const;
-  StateValue ule(const Pointer &rhs) const;
-  StateValue ult(const Pointer &rhs) const;
-  StateValue uge(const Pointer &rhs) const;
-  StateValue ugt(const Pointer &rhs) const;
-
-  smt::expr inbounds(bool simplify_ptr = false, bool strict = false);
-  smt::expr blockAlignment() const; // log(bits)
-  smt::expr isBlockAligned(unsigned align, bool exact = false) const;
-  smt::expr isAligned(unsigned align);
-  smt::AndExpr isDereferenceable(uint64_t bytes, unsigned align = bits_byte / 8,
-                                 bool iswrite = false);
-  smt::AndExpr isDereferenceable(const smt::expr &bytes, unsigned align,
-                                 bool iswrite);
-  void isDisjointOrEqual(const smt::expr &len1, const Pointer &ptr2,
-                         const smt::expr &len2) const;
-  smt::expr isBlockAlive() const;
-  smt::expr isWritable() const;
-  smt::expr isByval() const;
-
-  enum AllocType {
-    GLOBAL,
-    STACK,
-    MALLOC,
-    CXX_NEW,
-  };
-  smt::expr getAllocType() const;
-  smt::expr isHeapAllocated() const;
-  smt::expr isNocapture(bool simplify = true) const;
-  smt::expr isReadonly() const;
-  smt::expr isReadnone() const;
-
-  void stripAttrs();
-
-  smt::expr refined(const Pointer &other) const;
-  smt::expr fninputRefined(const Pointer &other, std::set<smt::expr> &undef,
-                           bool is_byval_arg) const;
-
-  const Memory& getMemory() const { return m; }
-
-  static Pointer mkNullPointer(const Memory &m);
-  smt::expr isNull() const;
-  smt::expr isNonZero() const;
-
-  // for container use only
-  bool operator<(const Pointer &rhs) const;
-
-  friend std::ostream& operator<<(std::ostream &os, const Pointer &p);
 };
 
 
@@ -214,6 +96,8 @@ class Memory {
     bool mayAlias(bool local, unsigned bid) const;
     unsigned numMayAlias(bool local) const;
 
+    smt::expr mayAlias(bool local, const smt::expr &bid) const;
+
     void setMayAlias(bool local, unsigned bid);
     void setMayAliasUpTo(bool local, unsigned limit); // [0, limit]
     void setNoAlias(bool local, unsigned bid);
@@ -224,8 +108,7 @@ class Memory {
     void computeAccessStats() const;
     static void printStats(std::ostream &os);
 
-    // for container use only
-    bool operator<(const AliasSet &rhs) const;
+    auto operator<=>(const AliasSet &rhs) const = default;
 
     void print(std::ostream &os) const;
   };
@@ -243,10 +126,7 @@ class Memory {
     MemBlock(smt::expr &&val, DataType type)
       : val(std::move(val)), type(type) {}
 
-    bool operator<(const MemBlock &other) const {
-      return std::tie(val, undef, type) <
-             std::tie(other.val, other.undef, other.type);
-    }
+    std::weak_ordering operator<=>(const MemBlock &rhs) const;
   };
 
   std::vector<MemBlock> non_local_block_val;
@@ -271,13 +151,21 @@ class Memory {
   unsigned next_nonlocal_bid;
   unsigned nextNonlocalBid();
 
+  static bool observesAddresses();
+  static int isInitialMemBlock(const smt::expr &e, bool match_any_init = false);
+
   unsigned numLocals() const;
   unsigned numNonlocals() const;
+
+  smt::expr isBlockAlive(const smt::expr &bid, bool local) const;
 
   void mk_nonlocal_val_axioms(bool skip_consts);
 
   bool mayalias(bool local, unsigned bid, const smt::expr &offset,
                 unsigned bytes, unsigned align, bool write) const;
+
+  AliasSet computeAliasing(const Pointer &ptr, unsigned btyes, unsigned align,
+                           bool write) const;
 
   template <typename Fn>
   void access(const Pointer &ptr, unsigned btyes, unsigned align, bool write,
@@ -317,15 +205,14 @@ public:
   // TODO: missing local_* equivalents
   class CallState {
     std::vector<smt::expr> non_local_block_val;
-    smt::expr non_local_block_liveness;
+    smt::expr non_local_liveness;
     bool empty = true;
 
   public:
     static CallState mkIf(const smt::expr &cond, const CallState &then,
                           const CallState &els);
     smt::expr operator==(const CallState &rhs) const;
-    // for container use only
-    bool operator<(const CallState &rhs) const;
+    auto operator<=>(const CallState &rhs) const = default;
     friend class Memory;
   };
 
@@ -348,16 +235,12 @@ public:
     PtrInput(StateValue &&v, bool byval, bool nocapture) :
       val(std::move(v)), byval(byval), nocapture(nocapture) {}
     smt::expr operator==(const PtrInput &rhs) const;
-    bool operator<(const PtrInput &rhs) const {
-      return std::tie(val, byval, nocapture) <
-             std::tie(rhs.val, rhs.byval, rhs.nocapture);
-    }
+    auto operator<=>(const PtrInput &rhs) const = default;
   };
 
-  std::pair<smt::expr, smt::expr>
-    mkFnRet(const char *name, const std::vector<PtrInput> &ptr_inputs);
-  CallState mkCallState(const std::vector<PtrInput> *ptr_inputs, bool nofree)
-      const;
+  smt::expr mkFnRet(const char *name, const std::vector<PtrInput> &ptr_inputs);
+  CallState mkCallState(const std::string &fnname,
+                        const std::vector<PtrInput> *ptr_inputs, bool nofree);
   void setState(const CallState &st);
 
   // Allocates a new memory block and returns (pointer expr, allocated).
@@ -384,8 +267,8 @@ public:
   std::pair<StateValue, smt::AndExpr>
     load(const smt::expr &ptr, const Type &type, unsigned align);
 
-  // raw load
-  Byte load(const Pointer &p, std::set<smt::expr> &undef_vars, unsigned align);
+  // raw load; NB: no UB check
+  Byte load(const Pointer &p, std::set<smt::expr> &undef_vars);
 
   void memset(const smt::expr &ptr, const StateValue &val,
               const smt::expr &bytesize, unsigned align,
@@ -401,10 +284,9 @@ public:
   smt::expr int2ptr(const smt::expr &val) const;
 
   std::tuple<smt::expr, Pointer, std::set<smt::expr>>
-    refined(const Memory &other,
-            bool skip_constants,
-            const std::vector<PtrInput> *set_ptrs = nullptr)
-      const;
+    refined(const Memory &other, bool fncall,
+            const std::vector<PtrInput> *set_ptrs = nullptr,
+            const std::vector<PtrInput> *set_ptrs_other = nullptr) const;
 
   // Returns true if a nocapture pointer byte is not in the memory.
   smt::expr checkNocapture() const;
@@ -413,9 +295,7 @@ public:
   static Memory mkIf(const smt::expr &cond, const Memory &then,
                      const Memory &els);
 
-  // for container use only
-  bool operator<(const Memory &rhs) const;
-  bool cmpFnCallInput(const Memory &rhs) const;
+  auto operator<=>(const Memory &rhs) const = default;
 
   static void printAliasStats(std::ostream &os) {
     AliasSet::printStats(os);

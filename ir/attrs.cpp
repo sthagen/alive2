@@ -53,6 +53,8 @@ ostream& operator<<(ostream &os, const FnAttrs &attr) {
     os << " align(" << attr.align << ')';
   if (attr.has(FnAttrs::NoThrow))
     os << " nothrow";
+  if (attr.has(FnAttrs::NoAlias))
+    os << " noalias";
   return os;
 }
 
@@ -62,35 +64,23 @@ bool ParamAttrs::undefImpliesUB() const {
   return ub;
 }
 
-bool ParamAttrs::operator==(const ParamAttrs &rhs) const {
-  if (bits != rhs.bits)
-    return false;
+uint64_t ParamAttrs::getDerefBytes() const {
+  uint64_t bytes = 0;
+  if (has(ParamAttrs::Dereferenceable))
+    bytes = derefBytes;
+  // byval copies bytes; the ptr needs to be dereferenceable
+  if (has(ParamAttrs::ByVal))
+    bytes = max(bytes, (uint64_t)blockSize);
+  return bytes;
+}
 
-  if (has(Dereferenceable) && derefBytes != rhs.derefBytes)
-    return false;
-  if (has(ByVal) && blockSize != rhs.blockSize)
-    return false;
-  if (has(Align) && align != rhs.align)
-    return false;
-
-  return true;
+bool FnAttrs::poisonImpliesUB() const {
+  return has(Dereferenceable) || has(NoUndef) || has(NNaN);
 }
 
 bool FnAttrs::undefImpliesUB() const {
   bool ub = has(NoUndef);
   assert(!ub || poisonImpliesUB());
   return ub;
-}
-
-bool FnAttrs::operator==(const FnAttrs &rhs) const {
-  if (bits != rhs.bits)
-    return false;
-
-  if (has(Dereferenceable) && derefBytes != rhs.derefBytes)
-    return false;
-  if (has(Align) && align != rhs.align)
-    return false;
-
-  return true;
 }
 }

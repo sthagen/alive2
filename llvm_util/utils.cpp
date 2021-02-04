@@ -30,6 +30,7 @@ vector<unique_ptr<PtrType>> ptr_types;
 FloatType half_type("half", FloatType::Half);
 FloatType float_type("float", FloatType::Float);
 FloatType double_type("double", FloatType::Double);
+FloatType quad_type("fp128", FloatType::Quad);
 
 // cache complex types
 unordered_map<const llvm::Type*, unique_ptr<Type>> type_cache;
@@ -122,6 +123,8 @@ Type* llvm_type2alive(const llvm::Type *ty) {
     return &float_type;
   case llvm::Type::DoubleTyID:
     return &double_type;
+  case llvm::Type::FP128TyID:
+    return &quad_type;
 
   case llvm::Type::PointerTyID: {
     // TODO: support for non-64 bits pointers
@@ -181,7 +184,7 @@ Type* llvm_type2alive(const llvm::Type *ty) {
       auto vty = cast<llvm::VectorType>(ty);
       auto elems = vty->getElementCount().getKnownMinValue();
       auto ety = llvm_type2alive(vty->getElementType());
-      if (!ety || elems > 128)
+      if (!ety || elems > 1024)
         return nullptr;
       cache = make_unique<VectorType>("ty_" + to_string(type_id_counter++),
                                       elems, *ety);
@@ -195,7 +198,7 @@ Type* llvm_type2alive(const llvm::Type *ty) {
       auto elemty = aty->getElementType();
       auto elems = aty->getNumElements();
       auto ety = llvm_type2alive(elemty);
-      if (!ety || elems > 128)
+      if (!ety || elems > 100 * 1024)
         return nullptr;
 
       auto sz_with_padding = DL->getTypeAllocSize(elemty);
@@ -268,6 +271,10 @@ Value* get_operand(llvm::Value *v,
     case FloatType::Double:
       c = make_unique<FloatConst>(*ty, apfloat.convertToDouble());
       break;
+    case FloatType::Quad:
+      c = make_unique<FloatConst>(*ty,
+                                  apfloat.bitcastToAPInt().toString(10, true));
+      break;
     case FloatType::Unknown:
       UNREACHABLE();
     }
@@ -334,15 +341,7 @@ Value* get_operand(llvm::Value *v,
     unsigned opi = 0;
 
     for (unsigned i = 0; i < aty->numElementsConst(); ++i) {
-      if (aty->isPadding(i)) {
-        auto &padty = aty->getChild(i);
-        assert(padty.isIntType());
-        auto poison = make_unique<PoisonValue>(padty);
-        auto ret = poison.get();
-
-        current_fn->addConstant(move(poison));
-        vals.emplace_back(ret);
-      } else {
+      if (!aty->isPadding(i)) {
         if (auto op = get_operand(get_elem(opi), constexpr_conv, copy_inserter))
           vals.emplace_back(op);
         else

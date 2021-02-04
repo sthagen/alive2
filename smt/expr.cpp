@@ -6,6 +6,7 @@
 #include "util/compiler.h"
 #include <algorithm>
 #include <cassert>
+#include <climits>
 #include <limits>
 #include <memory>
 #include <string>
@@ -202,6 +203,10 @@ expr expr::mkDouble(double n) {
   return Z3_mk_fpa_numeral_double(ctx(), n, Z3_mk_fpa_sort_double(ctx()));
 }
 
+expr expr::mkQuad(double n) {
+  return Z3_mk_fpa_numeral_double(ctx(), n, Z3_mk_fpa_sort_quadruple(ctx()));
+}
+
 expr expr::mkNaN(const expr &type) {
   C2(type);
   return Z3_mk_fpa_nan(ctx(), type.sort());
@@ -250,6 +255,10 @@ expr expr::mkFloatVar(const char *name) {
 
 expr expr::mkDoubleVar(const char *name) {
   return ::mkVar(name, Z3_mk_fpa_sort_double(ctx()));
+}
+
+expr expr::mkQuadVar(const char *name) {
+  return ::mkVar(name, Z3_mk_fpa_sort_quadruple(ctx()));
 }
 
 expr expr::mkFreshVar(const char *prefix, const expr &type) {
@@ -579,6 +588,9 @@ expr expr::operator-(const expr &rhs) const {
 }
 
 expr expr::operator*(const expr &rhs) const {
+  uint64_t n, power;
+  if (rhs.isUInt(n) && is_power2(n, &power))
+    return *this << expr::mkUInt(power, rhs.sort());
   return binopc(Z3_mk_bvmul, operator*, Z3_OP_BMUL, isOne, isZero);
 }
 
@@ -939,14 +951,49 @@ expr expr::fdiv(const expr &rhs) const {
   return Z3_mk_fpa_div(ctx(), rm, ast(), rhs());
 }
 
+expr expr::fabs() const {
+  return unop_fold(Z3_mk_fpa_abs);
+}
+
+expr expr::fneg() const {
+  return unop_fold(Z3_mk_fpa_neg);
+}
+
+expr expr::sqrt() const {
+  C();
+  auto rm = Z3_mk_fpa_round_nearest_ties_to_even(ctx());
+  return Z3_mk_fpa_sqrt(ctx(), rm, ast());
+}
+
 expr expr::fma(const expr &a, const expr &b, const expr &c) {
   C2(a, b, c);
   auto rm = Z3_mk_fpa_round_nearest_ties_to_even(ctx());
   return Z3_mk_fpa_fma(ctx(), rm, a(), b(), c());
 }
 
-expr expr::fneg() const {
-  return unop_fold(Z3_mk_fpa_neg);
+expr expr::ceil() const {
+  C();
+  return Z3_mk_fpa_round_to_integral(ctx(), Z3_mk_fpa_rtp(ctx()), ast());
+}
+
+expr expr::floor() const {
+  C();
+  return Z3_mk_fpa_round_to_integral(ctx(), Z3_mk_fpa_rtn(ctx()), ast());
+}
+
+expr expr::roundna() const {
+  C();
+  return Z3_mk_fpa_round_to_integral(ctx(), Z3_mk_fpa_rna(ctx()), ast());
+}
+
+expr expr::roundne() const {
+  C();
+  return Z3_mk_fpa_round_to_integral(ctx(), Z3_mk_fpa_rne(ctx()), ast());
+}
+
+expr expr::roundtz() const {
+  C();
+  return Z3_mk_fpa_round_to_integral(ctx(), Z3_mk_fpa_rtz(ctx()), ast());
 }
 
 expr expr::foeq(const expr &rhs) const {
@@ -1442,6 +1489,8 @@ expr expr::extract(unsigned high, unsigned low) const {
         return a.extract(high - b_bw, low - b_bw);
       if (low == 0)
         return a.extract(high - b_bw, 0).concat(b);
+      if (a.isConst())
+        return a.extract(high - b_bw, 0).concat(b.extract(b_bw-1, low));
     }
   }
   {
@@ -1770,6 +1819,35 @@ set<expr> expr::vars(const vector<const expr*> &exprs) {
   return result;
 }
 
+set<expr> expr::leafs(unsigned max) const {
+  C();
+  vector<expr> worklist = { *this };
+  unordered_set<Z3_ast> seen;
+  set<expr> ret;
+  do {
+    auto val = move(worklist.back());
+    worklist.pop_back();
+    if (!seen.emplace(val()).second)
+      continue;
+
+    expr cond, then, els;
+    if (val.isIf(cond, then, els)) {
+      worklist.emplace_back(move(then));
+      worklist.emplace_back(move(els));
+    } else {
+      ret.emplace(move(val));
+    }
+
+    if (ret.size() + worklist.size() >= max) {
+      for (auto &v : worklist)
+        ret.emplace(move(v));
+      break;
+    }
+  } while (!worklist.empty());
+
+  return ret;
+}
+
 void expr::printUnsigned(ostream &os) const {
   os << numeral_string();
 }
@@ -1803,14 +1881,9 @@ ostream& operator<<(ostream &os, const expr &e) {
   return os << (e.isValid() ? Z3_ast_to_string(ctx(), e()) : "(null)");
 }
 
-bool expr::operator<(const expr &rhs) const {
-  if (!isValid()) {
-    return rhs.isValid();
-  }
-  if (!rhs.isValid())
-    return false;
-  assert((id() == rhs.id()) == eq(rhs));
-  return id() < rhs.id();
+strong_ordering expr::operator<=>(const expr &rhs) const {
+  return
+    (isValid() ? id() : UINT_MAX) <=> (rhs.isValid() ? rhs.id() : UINT_MAX);
 }
 
 unsigned expr::id() const {
@@ -1819,31 +1892,6 @@ unsigned expr::id() const {
 
 unsigned expr::hash() const {
   return Z3_get_ast_hash(ctx(), ast());
-}
-
-
-ExprLeafIterator::ExprLeafIterator(const expr &init)
-  : worklist({init}), end(false) {
-  ++*this;
-}
-
-void ExprLeafIterator::operator++(void) {
-  assert(!end);
-  while (!worklist.empty()) {
-    val = move(worklist.back());
-    worklist.pop_back();
-    if (!val.isValid() || !seen.insert(val()).second)
-      continue;
-
-    expr cond, then, els;
-    if (val.isIf(cond, then, els)) {
-      worklist.emplace_back(move(then));
-      worklist.emplace_back(move(els));
-    } else {
-      return;
-    }
-  }
-  end = true;
 }
 
 }

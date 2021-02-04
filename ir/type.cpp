@@ -135,6 +135,10 @@ expr Type::enforceFloatType() const {
   return false;
 }
 
+expr Type::enforceScalarType() const {
+  return enforceIntType() || enforcePtrType() || enforceFloatType();
+}
+
 expr Type::enforceVectorType() const {
   return enforceVectorType([](auto &ty) { return true; });
 }
@@ -240,7 +244,8 @@ expr Type::fromInt(expr e) const {
 }
 
 StateValue Type::fromInt(StateValue v) const {
-  return { fromInt(move(v.value)), v.non_poison == 0 };
+  return { fromInt(move(v.value)),
+           v.non_poison.isBool() ? expr(v.non_poison) : v.non_poison == 0 };
 }
 
 expr Type::combine_poison(const expr &boolean, const expr &orig) const {
@@ -371,10 +376,11 @@ void IntType::print(ostream &os) const {
 
 
 // total bits, exponent bits
-static array<pair<unsigned, unsigned>, 3> float_sizes = {
+static array<pair<unsigned, unsigned>, 4> float_sizes = {
   /* Half */   make_pair(16, 5),
   /* Float */  make_pair(32, 8),
   /* Double */ make_pair(64, 11),
+  /* Quad */   make_pair(128, 15),
 };
 
 unsigned FloatType::bits() const {
@@ -483,6 +489,7 @@ StateValue FloatType::getDummyValue(bool non_poison) const {
   case Half:    e = expr::mkHalf(0); break;
   case Float:   e = expr::mkFloat(0); break;
   case Double:  e = expr::mkDouble(0); break;
+  case Quad:    e = expr::mkQuad(0); break;
   case Unknown: UNREACHABLE();
   }
   return { move(e), non_poison };
@@ -539,6 +546,7 @@ expr FloatType::mkInput(State &s, const char *name,
   case Half:    return expr::mkHalfVar(name);
   case Float:   return expr::mkFloatVar(name);
   case Double:  return expr::mkDoubleVar(name);
+  case Quad:    return expr::mkQuadVar(name);
   case Unknown: UNREACHABLE();
   }
   UNREACHABLE();
@@ -571,6 +579,9 @@ void FloatType::print(ostream &os) const {
     break;
   case Double:
     os << "double";
+    break;
+  case Quad:
+    os << "fp128";
     break;
   case Unknown:
     break;
@@ -861,9 +872,11 @@ expr AggregateType::enforceAggregateType(vector<Type*> *element_types) const {
   if (children.size() < element_types->size())
     return false;
 
-  expr r = numElements() == element_types->size();
-  for (unsigned i = 0, e = element_types->size(); i != e; ++i) {
-    r &= *children[i] == *(*element_types)[i];
+  expr r = numElementsExcludingPadding() == element_types->size();
+  auto types = element_types->begin(), types_E = element_types->end();
+  for (unsigned i = 0, e = children.size(); i != e && types != types_E; ++i) {
+    if (!isPadding(i))
+      r &= *children[i] == **types++;
   }
   return r;
 }

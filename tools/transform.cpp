@@ -8,6 +8,7 @@
 #include "smt/smt.h"
 #include "smt/solver.h"
 #include "util/config.h"
+#include "util/dataflow.h"
 #include "util/errors.h"
 #include "util/stopwatch.h"
 #include "util/symexec.h"
@@ -110,7 +111,9 @@ static void error(Errors &errs, State &src_state, State &tgt_state,
 
   if (r.isInvalid()) {
     errs.add("Invalid expr", false);
-    auto &unsupported = src_state.getUnsupported();
+    auto unsupported = src_state.getUnsupported();
+    auto &u_tgt = tgt_state.getUnsupported();
+    unsupported.insert(u_tgt.begin(), u_tgt.end());
     if (!unsupported.empty()) {
       string str = "The program uses the following unsupported features: ";
       bool first = true;
@@ -144,6 +147,22 @@ static void error(Errors &errs, State &src_state, State &tgt_state,
   string empty;
   auto &var_name = var ? var->getName() : empty;
   auto &m = r.getModel();
+
+  auto &src_approx = src_state.getApproximations();
+  auto &tgt_approx = tgt_state.getApproximations();
+  if (!src_approx.empty() || !tgt_approx.empty()) {
+    s << "Couldn't prove the correctness of the transformation\n"
+         "Alive2 approximated the semantics of the programs and therefore we\n"
+         "cannot conclude whether the bug found is valid or not.\n\n"
+         "Approximations done:\n";
+    auto approx = src_approx;
+    approx.insert(tgt_approx.begin(), tgt_approx.end());
+    for (auto &a : approx) {
+      s << " - " << a << '\n';
+    }
+    errs.add(s.str(), false);
+    return;
+  }
 
   s << msg;
   if (!var_name.empty())
@@ -218,11 +237,13 @@ static void instantiate_undef(const Input *in, map<expr, expr> &instances,
 
   expr nums[2] = { expr::mkUInt(0, 1), expr::mkUInt(1, 1) };
 
-  for (auto &[e, v] : instances) {
+  for (auto I = instances.begin(); I != instances.end();
+       I = instances.erase(I)) {
+    auto &[e, v] = *I;
     for (unsigned i = 0; i < 2; ++i) {
       expr newexpr = e.subst(var, nums[i]);
       if (newexpr.eq(e)) {
-        instances2[move(newexpr)] = v;
+        instances2[move(newexpr)] = move(v);
         break;
       }
 
@@ -434,10 +455,9 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   auto print_ptr_load = [&](ostream &s, const Model &m) {
     set<expr> undef;
     Pointer p(src_mem, m[ptr_refinement()]);
-    unsigned align = bits_byte / 8;
     s << "\nMismatch in " << p
-      << "\nSource value: " << Byte(src_mem, m[src_mem.load(p, undef, align)()])
-      << "\nTarget value: " << Byte(tgt_mem, m[tgt_mem.load(p, undef, align)()]);
+      << "\nSource value: " << Byte(src_mem, m[src_mem.load(p, undef)()])
+      << "\nTarget value: " << Byte(tgt_mem, m[tgt_mem.load(p, undef)()]);
   };
 
   expr dom_constr;
@@ -509,6 +529,7 @@ static bool returns_local(const Value &v) {
   return dynamic_cast<const Alloc*>(&v) ||
          dynamic_cast<const Malloc*>(&v) ||
          dynamic_cast<const Calloc*>(&v);
+         // TODO: add noalias fn
 }
 
 static bool may_be_nonlocal(Value *ptr) {
@@ -534,8 +555,8 @@ static bool may_be_nonlocal(Value *ptr) {
     }
 
     if (auto phi = dynamic_cast<Phi*>(ptr)) {
-      for (auto &op : phi->operands())
-        todo.emplace_back(op);
+      auto ops = phi->operands();
+      todo.insert(todo.end(), ops.begin(), ops.end());
       continue;
     }
 
@@ -580,11 +601,56 @@ static unsigned returns_nonlocal(const Instr &inst,
   }
   else if (auto load = dynamic_cast<const Load *>(&inst)) {
     if (may_be_nonlocal(&load->getPtr())) {
-      auto [ptr, offset] = collect_gep_offsets(load->getPtr());
-      rets_nonloc = cache.emplace(ptr, offset).second;
+      rets_nonloc = cache.emplace(collect_gep_offsets(load->getPtr())).second;
     }
   }
   return rets_nonloc ? num_ptrs(inst.getType()) : 0;
+}
+
+namespace {
+struct CountMemBlock {
+  unsigned num_nonlocals = 0;
+  set<pair<Value*, uint64_t>> nonlocal_cache;
+
+  void exec(const Instr &i, CountMemBlock &glb_data) {
+    if (returns_local(i)) {
+      // TODO: can't be path sensitive yet
+    } else {
+      num_nonlocals += returns_nonlocal(i, nonlocal_cache);
+      glb_data.num_nonlocals += returns_nonlocal(i, glb_data.nonlocal_cache);
+      num_nonlocals = min(num_nonlocals, glb_data.num_nonlocals);
+    }
+  }
+
+  void merge(const CountMemBlock &other) {
+    // if LHS has x more non-locals than RHS, then it gets to keep the first
+    // x cached accessed pointers, as for sure we have accessed all common
+    // pointers plus x extra pointers if we go through the LHS path
+    unsigned delta = num_nonlocals - other.num_nonlocals;
+    bool lhs_larger = num_nonlocals >= other.num_nonlocals;
+    if (!lhs_larger) {
+      num_nonlocals = other.num_nonlocals;
+      delta = -delta;
+    }
+
+    for (auto I = nonlocal_cache.begin(); I != nonlocal_cache.end(); ) {
+      if (other.nonlocal_cache.count(*I)) {
+        ++I;
+      } else if (delta > 0) {
+        ++I;
+        --delta;
+      } else {
+        I = nonlocal_cache.erase(I);
+      }
+    }
+
+    for (auto &e : other.nonlocal_cache) {
+      if (delta > 0 && nonlocal_cache.emplace(e).second) {
+        --delta;
+      }
+    }
+  }
+};
 }
 
 
@@ -634,8 +700,6 @@ static void calculateAndInitConstants(Transform &t) {
       num_ptrinputs += n;
   }
 
-  // The number of instructions that can return a pointer to a non-local block.
-  unsigned num_nonlocals_inst_src = 0, num_nonlocals_inst_tgt = 0;
   // The number of local blocks.
   num_locals_src = 0;
   num_locals_tgt = 0;
@@ -668,29 +732,24 @@ static void calculateAndInitConstants(Transform &t) {
   for (auto fn : { &t.src, &t.tgt }) {
     unsigned &cur_num_locals = fn == &t.src ? num_locals_src : num_locals_tgt;
     uint64_t &cur_max_gep    = fn == &t.src ? max_gep_src : max_gep_tgt;
-    auto &num_nonlocals_inst = fn == &t.src ? num_nonlocals_inst_src
-                                            : num_nonlocals_inst_tgt;
 
     for (auto &v : fn->getInputs()) {
       auto *i = dynamic_cast<const Input *>(&v);
       if (!i)
         continue;
 
-      uint64_t align = i->getAttributes().align;
       if (i->hasAttribute(ParamAttrs::Dereferenceable)) {
         does_mem_access = true;
         uint64_t deref_bytes = i->getAttributes().derefBytes;
-        min_access_size = gcd(min_access_size, gcd(deref_bytes, align));
         max_access_size = max(max_access_size, deref_bytes);
       }
       if (i->hasAttribute(ParamAttrs::ByVal)) {
         does_mem_access = true;
-        auto sz = i->getAttributes().blockSize;
+        uint64_t sz = i->getAttributes().blockSize;
         max_access_size = max(max_access_size, sz);
         min_global_size = min_global_size != UINT64_MAX
                             ? gcd(sz, min_global_size)
                             : sz;
-        min_global_size = gcd(min_global_size, align);
       }
     }
 
@@ -702,13 +761,10 @@ static void calculateAndInitConstants(Transform &t) {
         min_vect_elem_sz = elemsz;
     };
 
-    set<pair<Value*, uint64_t>> nonlocal_cache;
     for (auto BB : fn->getBBs()) {
       for (auto &i : BB->instrs()) {
         if (returns_local(i))
           ++cur_num_locals;
-        else
-          num_nonlocals_inst += returns_nonlocal(i, nonlocal_cache);
 
         for (auto op : i.operands()) {
           nullptr_is_used |= has_nullptr(op);
@@ -759,6 +815,12 @@ static void calculateAndInitConstants(Transform &t) {
     }
   }
 
+  unsigned num_nonlocals_inst_src;
+  {
+    DenseDataFlow<CountMemBlock> df(t.src);
+    num_nonlocals_inst_src = df.getResult().num_nonlocals;
+  }
+
   does_ptr_mem_access = has_ptr_load || does_ptr_store;
   if (does_any_byte_access && !does_int_mem_access && !does_ptr_mem_access)
     // Use int bytes only
@@ -773,7 +835,6 @@ static void calculateAndInitConstants(Transform &t) {
       min_global_size = min_global_size != UINT64_MAX
                           ? gcd(sz, min_global_size)
                           : sz;
-      min_global_size = gcd(min_global_size, glb->getAlignment());
     }
   }
 
@@ -826,23 +887,7 @@ static void calculateAndInitConstants(Transform &t) {
   bits_size_t = ilog2_ceil(max_alloc_size, true);
   bits_size_t = min(max(bits_for_offset, bits_size_t)+1, bits_program_pointer);
 
-  // size of byte
-  if (num_globals != 0) {
-    if (does_mem_access || has_vector_bitcast)
-      min_access_size = gcd(min_global_size, min_access_size);
-    else {
-      min_access_size = min_global_size;
-      while (min_access_size > 8) {
-        if (min_access_size % 2) {
-          min_access_size = 1;
-          break;
-        }
-        min_access_size /= 2;
-      }
-    }
-  }
-  bits_byte = 8 * ((does_mem_access || num_globals != 0)
-                     ? (unsigned)min_access_size : 1);
+  bits_byte = 8 * (does_mem_access ?  (unsigned)min_access_size : 1);
 
   bits_poison_per_byte = 1;
   if (min_vect_elem_sz > 0)
@@ -917,8 +962,7 @@ pair<unique_ptr<State>, unique_ptr<State>> TransformVerify::exec() const {
 }
 
 Errors TransformVerify::verify() const {
-  if (t.src.getFnAttrs() != t.tgt.getFnAttrs() ||
-      !t.src.hasSameInputs(t.tgt)) {
+  if (!t.src.hasSameInputs(t.tgt)) {
     return { "Unsupported interprocedural transformation: signature mismatch "
              "between src and tgt", false };
   }

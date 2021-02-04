@@ -104,8 +104,7 @@ Running Alive2 as a Clang Plugin
 --------
 
 This plugin tries to validate every IR-level transformation performed
-by LLVM.  To build it, add `-DCLANG_PLUGIN=1` to the cmake
-command. Then, invoke the plugin like this:
+by LLVM.  Invoke the plugin like this:
 
 ```
 $ clang -O3 <src.c> -S -emit-llvm \
@@ -121,25 +120,42 @@ $ $HOME/alive2/build/alive++ -O3 -c <src.cpp>
 ```
 
 The Clang plugin can optionally use multiple cores. To enable parallel
-translation validation, add the `-mllvm -tv-parallel-jobserver`
-command line options to Clang. In this mode, the Clang plugin uses the
-POSIX jobserver, a mechanism provided by GNU Make to provide global
-control over parallel execution of recursive make invocations. This
-mechanism will only work if GNU Make believes that clang is a
-recursive make command; tell it this by prefixing the `alivecc`
-command with a `+` character in your Makefile. Alas, Ninja does not
-provide a jobserver.
+translation validation, add the `-mllvm -tv-parallel-XXX` command line
+options to Clang, where XXX is one of two parallelism managers
+supported by Alive2. The first (XXX=fifo) uses alive-jobserver: for
+details about how to use this program, please consult its help output
+by running it without any command line arguments. The second
+parallelism manager (XXX=unrestricted) does not restrict parallelism
+at all, but rather calls fork() freely. This is mainly intended for
+developer use; it tends to use a lot of RAM.
 
-Because parallel TV jobs complete out of order, Alive2's output will
-be garbled if you allow it to go to the terminal. Avoid this problem
-by always using the (`-mllvm -tv-report-dir=dir`) options for runs
-where Alive2 uses multiple cores. This tells Alive2 to place its
-output files into a specific directory.
+Use the `-mllvm -tv-report-dir=dir` to tell Alive2 to place its output
+files into a specific directory.
 
 The Clang plugin's output can be voluminous. To help control this, it
 supports an option to reduce the amount of output (`-mllvm
 -tv-succinct`).
 
+Our goal is for the `alivecc` and `alive++` compiler drivers to be
+drop-in replacements for `clang` and `clang++`. So, for example, they
+try to detect when they are being invoked as assemblers or linkers, in
+which case they do not load the Alive2 plugin. This means that some
+projects cannot be built if you manually specify command line options
+to Alive2, for example using `-DCMAKE_C_FLAGS=...`. Instead, you can
+tell `alivecc` and `alive++` what to do using a collection of
+environment variables that generally mirror the plugin's command line
+interface. For example:
+
+```
+ALIVECC_PARALLEL_UNRESTRICTED=1
+ALIVECC_PARALLEL_FIFO=1
+ALIVECC_DISABLE_UNDEF_INPUT=1
+ALIVECC_DISABLE_POISON_INPUT=1
+ALIVECC_SMT_TO=timeout in milliseconds
+ALIVECC_SUBPROCESS_TIMEOUT=timeout in seconds
+ALIVECC_OVERWRITE_REPORTS=1
+ALIVECC_REPORT_DIR=dir
+```
 
 Running the Standalone Translation Validation Tool (alive-tv)
 --------

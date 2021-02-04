@@ -24,7 +24,8 @@ StateValue StateValue::zext(unsigned amount) const {
 }
 
 StateValue StateValue::trunc(unsigned bw_val, unsigned bw_np) const {
-  return { value.trunc(bw_val), non_poison.trunc(bw_np) };
+  return { value.trunc(bw_val),
+           non_poison.isBool() ? expr(non_poison) : non_poison.trunc(bw_np) };
 }
 
 StateValue StateValue::zextOrTrunc(unsigned tobw) const {
@@ -36,7 +37,7 @@ StateValue StateValue::zextOrTrunc(unsigned tobw) const {
 
 StateValue StateValue::concat(const StateValue &other) const {
   return { value.concat(other.value),
-           non_poison.isBool() ? expr(non_poison)
+           non_poison.isBool() ? non_poison && other.non_poison
                                : non_poison.concat(other.non_poison) };
 }
 
@@ -75,10 +76,6 @@ StateValue StateValue::subst(const vector<pair<expr, expr>> &repls) const {
     np = non_poison;
   }
   return { then.eq(v1) ? move(els) : move(then), move(np) };
-}
-
-bool StateValue::operator<(const StateValue &rhs) const {
-  return tie(value, non_poison) < tie(rhs.value, rhs.non_poison);
 }
 
 ostream& operator<<(ostream &os, const StateValue &val) {

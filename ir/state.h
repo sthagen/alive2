@@ -30,21 +30,12 @@ public:
 
 private:
   struct CurrentDomain {
-    smt::expr path; // path from fn entry
+    smt::expr path = true; // path from fn entry
     smt::AndExpr UB;
     std::set<smt::expr> undef_vars;
 
     smt::expr operator()() const;
     operator bool() const;
-    void reset();
-  };
-
-  struct DomainPreds {
-    smt::OrExpr path;
-    smt::DisjointExpr<smt::expr> UB;
-    std::set<smt::expr> undef_vars;
-
-    smt::expr operator()() const;
   };
 
   struct ValueAnalysis {
@@ -63,14 +54,40 @@ private:
     void intersect(const ValueAnalysis &other);
   };
 
-  struct BasicBlockInfo {
-    DomainPreds domain;
-    ValueAnalysis analysis;
-    smt::DisjointExpr<Memory> mem;
+  struct VarArgsEntry {
+    smt::expr alive;
+    smt::expr next_arg;
+    smt::expr num_args;
+    smt::expr is_va_start;
+    smt::expr active; // false if this entry is repeated
+
+    VarArgsEntry() {}
+    VarArgsEntry(smt::expr &&alive, smt::expr &&next_arg, smt::expr &&num_args,
+                 smt::expr &&is_va_start, smt::expr &&active)
+      : alive(std::move(alive)), next_arg(std::move(next_arg)),
+        num_args(std::move(num_args)), is_va_start(std::move(is_va_start)),
+        active(std::move(active)) {}
+
+    auto operator<=>(const VarArgsEntry &rhs) const = default;
   };
 
-  // TODO: make this const again
-  Function &f;
+  struct VarArgsData {
+    std::map<smt::expr, VarArgsEntry> data;
+    static VarArgsData mkIf(const smt::expr &cond, const VarArgsData &then,
+                            const VarArgsData &els);
+    auto operator<=>(const VarArgsData &rhs) const = default;
+  };
+
+  struct BasicBlockInfo {
+    smt::OrExpr path;
+    smt::DisjointExpr<smt::expr> UB;
+    smt::DisjointExpr<Memory> mem;
+    std::set<smt::expr> undef_vars;
+    ValueAnalysis analysis;
+    VarArgsData var_args;
+  };
+
+  const Function &f;
   bool source;
   bool disable_undef_rewrite = false;
   bool is_initialization_phase = true;
@@ -78,8 +95,8 @@ private:
   smt::AndExpr axioms;
 
   std::set<const char*> used_unsupported;
+  std::set<std::string> used_approximations;
 
-  const BasicBlock *current_bb = nullptr;
   std::set<smt::expr> quantified_vars;
 
   // var -> ((value, not_poison), undef_vars)
@@ -93,15 +110,19 @@ private:
   std::unordered_set<const BasicBlock*> seen_bbs;
 
   // Global variables' memory block ids & Memory::alloc has been called?
-  std::unordered_map<std::string, std::pair<unsigned, bool> > glbvar_bids;
+  std::unordered_map<std::string, std::pair<unsigned, bool>> glbvar_bids;
 
   // temp state
+  const BasicBlock *current_bb = nullptr;
   CurrentDomain domain;
   Memory memory;
   std::set<smt::expr> undef_vars;
   ValueAnalysis analysis;
   std::array<StateValue, 64> tmp_values;
+  StateValue null_sv;
   unsigned i_tmp_values = 0; // next available position in tmp_values
+
+  StateValue* no_more_tmp_slots();
 
   // return_domain: a boolean expression describing return condition
   smt::OrExpr return_domain;
@@ -124,7 +145,7 @@ private:
                         const ValueAnalysis::FnCallRanges &fncall_ranges,
                         const Memory &m, bool readsmem, bool argmemonly) const;
 
-    bool operator<(const FnCallInput &rhs) const;
+    auto operator<=>(const FnCallInput &rhs) const = default;
   };
 
   struct FnCallOutput {
@@ -135,14 +156,16 @@ private:
     static FnCallOutput mkIf(const smt::expr &cond, const FnCallOutput &then,
                              const FnCallOutput &els);
     smt::expr operator==(const FnCallOutput &rhs) const;
-    bool operator<(const FnCallOutput &rhs) const;
+    auto operator<=>(const FnCallOutput &rhs) const = default;
   };
   std::map<std::string, std::map<FnCallInput, FnCallOutput>> fn_call_data;
   smt::expr fn_call_pre = true;
   std::set<smt::expr> fn_call_qvars;
 
+  VarArgsData var_args_data;
+
 public:
-  State(Function &f, bool source);
+  State(const Function &f, bool source);
 
   static void resetGlobals();
 
@@ -181,8 +204,13 @@ public:
               std::vector<Memory::PtrInput> &&ptr_inputs,
               const std::vector<Type*> &out_types, const FnAttrs &attrs);
 
+  auto& getVarArgsData() { return var_args_data.data; }
+
   void useUnsupported(const char *name);
   auto& getUnsupported() const { return used_unsupported; }
+
+  void doesApproximation(std::string &&name);
+  auto& getApproximations() const { return used_approximations; }
 
   void addQuantVar(const smt::expr &var);
   void addFnQuantVar(const smt::expr &var);

@@ -22,16 +22,6 @@ State::CurrentDomain::operator bool() const {
   return !path.isFalse() && UB;
 }
 
-void State::CurrentDomain::reset() {
-  path = true;
-  UB.reset();
-  undef_vars.clear();
-}
-
-expr State::DomainPreds::operator()() const {
-  return path() && *UB();
-}
-
 template<class T>
 static T intersect_set(const T &a, const T &b) {
   T results;
@@ -85,7 +75,36 @@ State::ValueAnalysis::FnCallRanges::overlaps(const FnCallRanges &other) const {
   return true;
 }
 
-State::State(Function &f, bool source)
+State::VarArgsData
+State::VarArgsData::mkIf(const expr &cond, const VarArgsData &then,
+                         const VarArgsData &els) {
+  VarArgsData ret;
+  for (auto &[ptr, entry] : then.data) {
+    auto other = els.data.find(ptr);
+    if (other == els.data.end()) {
+      ret.data.try_emplace(ptr, cond && entry.alive, expr(entry.next_arg),
+                           expr(entry.num_args), expr(entry.is_va_start),
+                           expr(entry.active));
+    } else {
+#define C(f) expr::mkIf(cond, entry.f, other->second.f)
+      ret.data.try_emplace(ptr, C(alive), C(next_arg), C(num_args),
+                           C(is_va_start), C(active));
+#undef C
+    }
+  }
+
+  for (auto &[ptr, entry] : els.data) {
+    if (then.data.count(ptr))
+      continue;
+    ret.data.try_emplace(ptr, !cond && entry.alive, expr(entry.next_arg),
+                         expr(entry.num_args), expr(entry.is_va_start),
+                         expr(entry.active));
+  }
+
+  return ret;
+}
+
+State::State(const Function &f, bool source)
   : f(f), source(source), memory(*this),
     return_val(f.getType().getDummyValue(false)), return_memory(memory) {}
 
@@ -312,40 +331,41 @@ expr State::strip_undef_and_add_ub(const Value &val, const expr &e) {
   return e;
 }
 
+StateValue* State::no_more_tmp_slots() {
+  if (i_tmp_values < tmp_values.size())
+    return nullptr;
+  useUnsupported("Too many temporaries");
+  return &null_sv;
+}
+
 const StateValue& State::operator[](const Value &val) {
   auto &[var, val_uvars] = values[values_map.at(&val)];
   auto &[sval, uvars] = val_uvars;
-  (void)var;
 
   auto undef_itr = analysis.non_undef_vals.find(&val);
   bool is_non_undef = undef_itr != analysis.non_undef_vals.end();
+  bool is_non_poison = analysis.non_poison_vals.count(&val);
 
-  auto simplify = [&](StateValue &sv0, bool use_new_slot) -> StateValue&{
-    StateValue *sv = &sv0;
-    if (analysis.non_poison_vals.count(&val)) {
-      if (use_new_slot) {
-        assert(i_tmp_values < tmp_values.size());
-        tmp_values[i_tmp_values++] = *sv;
-        use_new_slot = false;
-      }
-      assert(i_tmp_values > 0);
-      StateValue &sv_new = tmp_values[i_tmp_values - 1];
+  auto simplify = [&](StateValue &sv0, bool use_new_slot) -> StateValue& {
+    if (!is_non_undef && !is_non_poison)
+      return sv0;
+
+    if (use_new_slot) {
+      if (auto ret = no_more_tmp_slots())
+        return *ret;
+      assert(i_tmp_values < tmp_values.size());
+      tmp_values[i_tmp_values++] = sv0;
+    }
+    assert(i_tmp_values > 0);
+    StateValue &sv_new = tmp_values[i_tmp_values - 1];
+    if (is_non_undef) {
+      sv_new.value = undef_itr->second;
+    }
+    if (is_non_poison) {
       const expr &np = sv_new.non_poison;
       sv_new.non_poison = np.isBool() ? true : expr::mkUInt(0, np);
-      sv = &sv_new;
     }
-
-    if (is_non_undef) {
-      if (use_new_slot) {
-        assert(i_tmp_values < tmp_values.size());
-        tmp_values[i_tmp_values++] = *sv;
-      }
-      assert(i_tmp_values > 0);
-      StateValue &sv_new = tmp_values[i_tmp_values - 1];
-      sv_new.value = undef_itr->second;
-      sv = &sv_new;
-    }
-    return *sv;
+    return sv_new;
   };
 
   if (is_non_undef) {
@@ -380,6 +400,9 @@ const StateValue& State::operator[](const Value &val) {
   for (auto &p : repls) {
     undef_vars.emplace(move(p.second));
   }
+
+  if (auto ret = no_more_tmp_slots())
+    return *ret;
 
   assert(i_tmp_values < tmp_values.size());
   tmp_values[i_tmp_values++] = move(sval_new);
@@ -456,6 +479,10 @@ State::getAndAddPoisonUB(const Value &val, bool undef_ub_too) {
     // If val is an aggregate, all elements should be non-poison
     addUB(not_poison_except_padding(val.getType(), sv.non_poison));
   }
+
+  if (auto ret = no_more_tmp_slots())
+    return *ret;
+
   assert(i_tmp_values < tmp_values.size());
   return tmp_values[i_tmp_values++] = { move(v),
            sv.non_poison.isBool() ? true : expr::mkUInt(0, sv.non_poison) };
@@ -468,7 +495,7 @@ const State::ValTy& State::at(const Value &val) const {
 const OrExpr* State::jumpCondFrom(const BasicBlock &bb) const {
   auto &pres = predecessor_data.at(current_bb);
   auto I = pres.find(&bb);
-  return I == pres.end() ? nullptr : &I->second.domain.path;
+  return I == pres.end() ? nullptr : &I->second.path;
 }
 
 bool State::isUndef(const expr &e) const {
@@ -480,8 +507,6 @@ bool State::startBB(const BasicBlock &bb) {
   ENSURE(seen_bbs.emplace(&bb).second);
   current_bb = &bb;
 
-  domain.reset();
-
   if (&f.getFirstBB() == &bb)
     return true;
 
@@ -491,28 +516,29 @@ bool State::startBB(const BasicBlock &bb) {
 
   DisjointExpr<Memory> in_memory;
   DisjointExpr<expr> UB;
+  DisjointExpr<VarArgsData> var_args_in;
   OrExpr path;
 
   bool isFirst = true;
   for (auto &[src, data] : I->second) {
-    (void)src;
-    auto &[dom, anlys, mem] = data;
-    path.add(dom.path);
-    expr p = dom.path();
-    UB.add_disj(dom.UB, p);
-    in_memory.add_disj(mem, move(p));
-    domain.undef_vars.insert(dom.undef_vars.begin(), dom.undef_vars.end());
+    path.add(data.path);
+    expr p = data.path();
+    UB.add_disj(data.UB, p);
+    in_memory.add_disj(data.mem, p);
+    var_args_in.add(data.var_args, move(p));
+    domain.undef_vars.insert(data.undef_vars.begin(), data.undef_vars.end());
 
     if (isFirst)
-      analysis = anlys;
+      analysis = data.analysis;
     else
-      analysis.intersect(anlys);
+      analysis.intersect(data.analysis);
     isFirst = false;
   }
 
   domain.path = path();
-  domain.UB.add(*UB());
+  domain.UB = *UB();
   memory = *in_memory();
+  var_args_data = *var_args_in();
 
   return domain;
 }
@@ -523,18 +549,18 @@ void State::addJump(const BasicBlock &dst0, expr &&cond) {
 
   auto dst = &dst0;
   if (seen_bbs.count(dst)) {
-    dst = &f.getBB("#sink");
+    dst = &f.getSinkBB();
   }
 
   cond &= domain.path;
   auto &data = predecessor_data[dst][current_bb];
   data.mem.add(memory, cond);
-  data.domain.UB.add(domain.UB(), cond);
-  data.domain.path.add(move(cond));
-  data.domain.undef_vars.insert(undef_vars.begin(), undef_vars.end());
-  data.domain.undef_vars.insert(domain.undef_vars.begin(),
-                                domain.undef_vars.end());
+  data.UB.add(domain.UB(), cond);
+  data.path.add(move(cond));
+  data.undef_vars.insert(undef_vars.begin(), undef_vars.end());
+  data.undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
   data.analysis = analysis;
+  data.var_args = var_args_data;
 }
 
 void State::addJump(const BasicBlock &dst) {
@@ -557,8 +583,9 @@ void State::addCondJump(const expr &cond, const BasicBlock &dst_true,
 void State::addReturn(StateValue &&val) {
   return_val.add(move(val), domain.path);
   return_memory.add(memory, domain.path);
-  return_domain.add(domain());
-  function_domain.add(domain());
+  auto dom = domain();
+  return_domain.add(expr(dom));
+  function_domain.add(move(dom));
   return_undef_vars.insert(undef_vars.begin(), undef_vars.end());
   return_undef_vars.insert(domain.undef_vars.begin(), domain.undef_vars.end());
   undef_vars.clear();
@@ -597,10 +624,7 @@ void State::addNoReturn() {
 expr State::FnCallInput::operator==(const FnCallInput &rhs) const {
   if (readsmem != rhs.readsmem ||
       argmemonly != rhs.argmemonly ||
-      (readsmem && (
-        fncall_ranges != rhs.fncall_ranges ||
-        m < rhs.m || rhs.m < m
-      )))
+      (readsmem && (fncall_ranges != rhs.fncall_ranges || is_neq(m <=> rhs.m))))
     return false;
 
   AndExpr eq;
@@ -656,30 +680,15 @@ expr State::FnCallInput::refinedBy(
     s.addFnQuantVar(v);
 
   if (readsmem) {
-    auto restrict_ptrs = argmemonly2 ? &args_ptr2 : nullptr;
-    auto data = m.refined(m2, true, restrict_ptrs);
+    auto restrict_ptrs = argmemonly ? &args_ptr : nullptr;
+    auto restrict_ptrs2 = argmemonly ? &args_ptr2 : nullptr;
+    auto data = m.refined(m2, true, restrict_ptrs, restrict_ptrs2);
     refines.add(get<0>(data));
     for (auto &v : get<2>(data))
       s.addFnQuantVar(v);
   }
 
   return refines();
-}
-
-bool State::FnCallInput::operator<(const FnCallInput &rhs) const {
-  return tie(args_nonptr, args_ptr, fncall_ranges, m, readsmem, argmemonly) <
-         tie(rhs.args_nonptr, rhs.args_ptr, rhs.fncall_ranges, rhs.m,
-             rhs.readsmem, rhs.argmemonly);
-#if 0
-  auto a = tie(args_nonptr, args_ptr, fncall_ranges, readsmem, argmemonly);
-  auto b = tie(rhs.args_nonptr, rhs.args_ptr, rhs.fncall_ranges, rhs.readsmem,
-               rhs.argmemonly);
-  if (a < b)
-    return true;
-  if (a > b)
-    return false;
-  return m.cmpFnCallInput(rhs.m);
-#endif
 }
 
 State::FnCallOutput State::FnCallOutput::mkIf(const expr &cond,
@@ -705,10 +714,6 @@ expr State::FnCallOutput::operator==(const FnCallOutput &rhs) const {
   return ret;
 }
 
-bool State::FnCallOutput::operator<(const FnCallOutput &rhs) const {
-  return tie(retvals, ub, callstate) < tie(rhs.retvals, rhs.ub, rhs.callstate);
-}
-
 vector<StateValue>
 State::addFnCall(const string &name, vector<StateValue> &&inputs,
                  vector<Memory::PtrInput> &&ptr_inputs,
@@ -730,9 +735,11 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
     return vector<StateValue>(out_types.size());
   }
 
-  for (auto &v : ptr_inputs) {
-    if (!v.byval && !v.nocapture && !v.val.non_poison.isFalse())
-      memory.escapeLocalPtr(v.val.value);
+  if (writes_memory) {
+    for (auto &v : ptr_inputs) {
+      if (!v.byval && !v.nocapture && !v.val.non_poison.isFalse())
+        memory.escapeLocalPtr(v.val.value);
+    }
   }
 
   vector<StateValue> retval;
@@ -753,8 +760,7 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
     if (inserted) {
       auto mk_val = [&](const Type &t, const string &name) {
         return t.isPtrType()
-                 // TODO: remove 2nd ret val of mkFnRet
-                 ? memory.mkFnRet(name.c_str(), I->first.args_ptr).first
+                 ? memory.mkFnRet(name.c_str(), I->first.args_ptr)
                  : expr::mkFreshVar(name.c_str(), t.getDummyValue(false).value);
       };
 
@@ -771,7 +777,8 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
       I->second
         = { move(values), expr::mkFreshVar(ub_name.c_str(), false),
             writes_memory
-              ? memory.mkCallState(argmemonly ? &I->first.args_ptr : nullptr,
+              ? memory.mkCallState(name,
+                                   argmemonly ? &I->first.args_ptr : nullptr,
                                    attrs.has(FnAttrs::NoFree))
               : Memory::CallState() };
 
@@ -779,7 +786,9 @@ State::addFnCall(const string &name, vector<StateValue> &&inputs,
       for (auto II = calls_fn.begin(), E = calls_fn.end(); II != E; ++II) {
         if (II == I)
           continue;
-        fn_call_pre &= (I->first == II->first).implies(I->second == II->second);
+        auto in_eq = I->first == II->first;
+        if (!in_eq.isFalse())
+          fn_call_pre &= in_eq.implies(I->second == II->second);
       }
     }
 
@@ -833,6 +842,10 @@ void State::useUnsupported(const char *name) {
   used_unsupported.emplace(name);
 }
 
+void State::doesApproximation(string &&name) {
+  used_approximations.emplace(move(name));
+}
+
 void State::addQuantVar(const expr &var) {
   quantified_vars.emplace(var);
 }
@@ -870,18 +883,13 @@ void State::finishInitializer() {
 }
 
 expr State::sinkDomain() const {
-  auto bb = f.getBBIfExists("#sink");
-  if (!bb)
-    return false;
-
-  auto I = predecessor_data.find(bb);
+  auto I = predecessor_data.find(&f.getSinkBB());
   if (I == predecessor_data.end())
     return false;
 
   OrExpr ret;
   for (auto &[src, data] : I->second) {
-    (void)src;
-    ret.add(data.domain.path());
+    ret.add(data.path());
   }
   return ret();
 }

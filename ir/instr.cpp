@@ -27,6 +27,9 @@ using namespace std;
   MemInstr::ByteAccessInfo cls::getByteAccessInfo() const \
   { return {}; }
 
+// log2 of max number of var args per function
+#define VARARG_BITS 8
+
 namespace {
 struct print_type {
   IR::Type &ty;
@@ -841,9 +844,15 @@ void UnaryOp::print(ostream &os) const {
   case BSwap:       str = "bswap "; break;
   case Ctpop:       str = "ctpop "; break;
   case IsConstant:  str = "is.constant "; break;
-  case FNeg:        str = "fneg "; break;
-  case FFS:         str = "ffs "; break;
   case FAbs:        str = "fabs "; break;
+  case FNeg:        str = "fneg "; break;
+  case Ceil:        str = "ceil "; break;
+  case Floor:       str = "floor "; break;
+  case Round:       str = "round "; break;
+  case RoundEven:   str = "roundeven "; break;
+  case Trunc:       str = "trunc "; break;
+  case Sqrt:        str = "sqrt "; break;
+  case FFS:         str = "ffs "; break;
   }
 
   os << getName() << " = " << str << fmath << print_type(getType())
@@ -884,20 +893,52 @@ StateValue UnaryOp::toSMT(State &s) const {
     s.addQuantVar(var);
     return { move(var), true };
   }
+  case FAbs:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np, [](expr &v) { return v.fabs(); }, fmath, true);
+    };
+    break;
   case FNeg:
     fn = [&](auto v, auto np) -> StateValue {
       return fm_poison(s, v, np, [](expr &v){ return v.fneg(); }, fmath, false);
     };
     break;
+  case Ceil:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np, [](expr &v) { return v.ceil(); }, fmath, true);
+    };
+    break;
+  case Floor:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np, [](expr &v) { return v.floor(); }, fmath, true);
+    };
+    break;
+  case Round:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np,
+                       [](expr &v) { return v.roundna(); }, fmath, true);
+    };
+    break;
+  case RoundEven:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np,
+                       [](expr &v) { return v.roundne(); }, fmath, true);
+    };
+    break;
+  case Trunc:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np,
+                       [](expr &v) { return v.roundtz(); }, fmath, true);
+    };
+    break;
+  case Sqrt:
+    fn = [&](auto v, auto np) -> StateValue {
+      return fm_poison(s, v, np, [](expr &v){ return v.sqrt(); }, fmath, false);
+    };
+    break;
   case FFS:
     fn = [](auto v, auto np) -> StateValue {
       return { v.cttz(expr::mkInt(-1, v)) + expr::mkUInt(1, v), expr(np) };
-    };
-    break;
-  case FAbs:
-    fn = [&](auto v, auto np) -> StateValue {
-      auto f = [](expr &v) { return expr::mkIf(v.isFPNeg(), v.fneg(), v); };
-      return fm_poison(s, v, np, f, fmath, true);
     };
     break;
   }
@@ -918,7 +959,7 @@ StateValue UnaryOp::toSMT(State &s) const {
 
 expr UnaryOp::getTypeConstraints(const Function &f) const {
   expr instrconstr = getType() == val->getType();
-  switch(op) {
+  switch (op) {
   case Copy:
     break;
   case BSwap:
@@ -929,18 +970,20 @@ expr UnaryOp::getTypeConstraints(const Function &f) const {
     break;
   case BitReverse:
   case Ctpop:
+  case FFS:
     instrconstr &= getType().enforceIntOrVectorType();
     break;
   case IsConstant:
     instrconstr = getType().enforceIntType(1);
     break;
-  case FNeg:
-    instrconstr &= getType().enforceFloatOrVectorType();
-    break;
-  case FFS:
-    instrconstr &= getType().enforceIntType();
-    break;
   case FAbs:
+  case FNeg:
+  case Ceil:
+  case Floor:
+  case Round:
+  case RoundEven:
+  case Trunc:
+  case Sqrt:
     instrconstr &= getType().enforceFloatOrVectorType();
     break;
   }
@@ -1217,18 +1260,16 @@ StateValue ConversionOp::toSMT(State &s) const {
     break;
   case FPToSInt:
     fn = [](auto &&val, auto &to_type) -> StateValue {
-      return { val.fp2sint(to_type.bits()),
-               val.foge(expr::IntSMin(to_type.bits()).sint2fp(val)) &&
-               val.fole(expr::IntSMax(to_type.bits()).sint2fp(val)) &&
-               !val.isInf() };
+      expr bv  = val.fp2sint(to_type.bits());
+      expr fp2 = bv.sint2fp(val);
+      return { move(bv), fp2 == val };
     };
     break;
   case FPToUInt:
     fn = [](auto &&val, auto &to_type) -> StateValue {
-      return { val.fp2uint(to_type.bits()),
-               val.foge(expr::mkFloat(0, val)) &&
-               val.fole(expr::IntUMax(to_type.bits()).uint2fp(val)) &&
-               !val.isInf() };
+      expr bv  = val.fp2uint(to_type.bits());
+      expr fp2 = bv.uint2fp(val);
+      return { move(bv), fp2 == val };
     };
     break;
   case FPExt:
@@ -1630,9 +1671,6 @@ void FnCall::print(ostream &os) const {
     first = false;
   }
   os << ')' << attrs;
-
-  if (!valid)
-    os << "\t; WARNING: unknown known function";
 }
 
 static void unpack_inputs(State &s, Value &argv, Type &ty,
@@ -1649,18 +1687,25 @@ static void unpack_inputs(State &s, Value &argv, Type &ty,
 
   auto unpack = [&](StateValue &&value) {
     if (ty.isPtrType()) {
+      expr np(true);
       Pointer p(s.getMemory(), move(value.value));
       p.stripAttrs();
-      if (argflag.has(ParamAttrs::Dereferenceable))
-        s.addUB(p.isDereferenceable(argflag.derefBytes, bits_byte / 8, false));
+      if (argflag.has(ParamAttrs::Dereferenceable) ||
+          argflag.has(ParamAttrs::ByVal))
+        s.addUB(
+          p.isDereferenceable(argflag.getDerefBytes(), argflag.align, false));
+      else if (argflag.has(ParamAttrs::Align))
+        np &= p.isAligned(argflag.align);
 
       if (argflag.has(ParamAttrs::NonNull))
-        s.addUB(p.isNonZero());
+        np &= p.isNonZero();
 
-      if (argflag.has(ParamAttrs::Align))
-        s.addUB(p.isAligned(argflag.align));
+      if (argflag.poisonImpliesUB()) {
+        s.addUB(move(np));
+        np = true;
+      }
 
-      ptr_inputs.emplace_back(StateValue(p.release(), move(value.non_poison)),
+      ptr_inputs.emplace_back(StateValue(p.release(), np && value.non_poison),
                               argflag.has(ParamAttrs::ByVal),
                               argflag.has(ParamAttrs::NoCapture));
     } else {
@@ -1698,33 +1743,40 @@ pack_return(State &s, Type &ty, vector<StateValue> &vals, const FnAttrs &attrs,
     return agg->aggregateVals(vs);
   }
 
-  auto &ret = vals[idx++];
-  if (ty.isFloatType() && attrs.has(FnAttrs::NNaN))
+  auto ret = move(vals[idx++]);
+  if (attrs.has(FnAttrs::NNaN)) {
+    assert(ty.isFloatType());
     ret.non_poison &= !ret.value.isNaN();
+  }
 
   bool isDeref = attrs.has(FnAttrs::Dereferenceable);
   bool isNonNull = attrs.has(FnAttrs::NonNull);
   bool isAlign = attrs.has(FnAttrs::Align);
 
-  if (ty.isPtrType() && (isDeref || isNonNull || isAlign)) {
+  if (isDeref || isNonNull || isAlign) {
+    assert(ty.isPtrType());
     Pointer p(s.getMemory(), ret.value);
-    s.addUB(ret.non_poison);
+
     if (isDeref)
-      s.addUB(p.isDereferenceable(attrs.derefBytes));
+      s.addUB(p.isDereferenceable(attrs.derefBytes, attrs.align));
+    else if (isAlign)
+      ret.non_poison &= p.isAligned(attrs.align);
+
     if (isNonNull)
-      s.addUB(p.isNonZero());
-    if (isAlign)
-      s.addUB(p.isAligned(attrs.align));
+      ret.non_poison &= p.isNonZero();
+  }
+
+  if (attrs.poisonImpliesUB()) {
+    s.addUB(move(ret.non_poison));
+    ret.non_poison = true;
   }
 
   return ret;
 }
 
 StateValue FnCall::toSMT(State &s) const {
-  if (!valid) {
-    s.addUB(expr());
-    return {};
-  }
+  if (approx)
+    s.doesApproximation("Unknown libcall: " + fnName);
 
   vector<StateValue> inputs;
   vector<Memory::PtrInput> ptr_inputs;
@@ -1755,6 +1807,29 @@ StateValue FnCall::toSMT(State &s) const {
   if (!isVoid())
     unpack_ret_ty(out_types, getType());
 
+  auto check_access = [&]() {
+    if (attrs.has(FnAttrs::ArgMemOnly)) {
+      for (auto &p : ptr_inputs) {
+        if (!p.byval) {
+          Pointer ptr(s.getMemory(), p.val.value);
+          s.addUB(p.val.non_poison.implies(ptr.isLocal()));
+        }
+      }
+    } else {
+      s.addUB(expr(false));
+    }
+  };
+
+  if (!attrs.has(FnAttrs::NoRead)) {
+    if (s.getFn().getFnAttrs().has(FnAttrs::NoRead))
+      check_access();
+  }
+
+  if (!attrs.has(FnAttrs::NoWrite)) {
+    if (s.getFn().getFnAttrs().has(FnAttrs::NoWrite))
+      check_access();
+  }
+
   unsigned idx = 0;
   auto ret = s.addFnCall(fnName_mangled.str(), move(inputs), move(ptr_inputs),
                          out_types, attrs);
@@ -1779,7 +1854,7 @@ expr FnCall::getTypeConstraints(const Function &f) const {
 
 unique_ptr<Instr> FnCall::dup(const string &suffix) const {
   auto r = make_unique<FnCall>(getType(), getName() + suffix, string(fnName),
-                               FnAttrs(attrs), valid);
+                               FnAttrs(attrs), approx);
   r->args = args;
   return r;
 }
@@ -2120,7 +2195,7 @@ void Phi::print(ostream &os) const {
 }
 
 StateValue Phi::toSMT(State &s) const {
-  DisjointExpr<StateValue> ret;
+  DisjointExpr<StateValue> ret(getType().getDummyValue(false));
   map<Value*, StateValue> cache;
 
   for (auto &[val, bb] : values) {
@@ -2312,17 +2387,21 @@ void Return::print(ostream &os) const {
   os << val->getName();
 }
 
-static void addUBForNoCaptureRet(State &s, const StateValue &svret,
-                                 const Type &t) {
-  auto &[vret, npret] = svret;
+static void check_ret_attributes(State &s, const StateValue &sv,
+                                 const Type &t, const FnAttrs &attrs) {
+  auto &[v, np] = sv;
   if (t.isPtrType()) {
-    s.addUB(npret.implies(!Pointer(s.getMemory(), vret).isNocapture()));
+    s.addUB(np.implies(!Pointer(s.getMemory(), v).isNocapture()));
     return;
+  }
+
+  if (attrs.has(FnAttrs::NNaN)) {
+    s.addUB(!v.isNaN());
   }
 
   if (auto agg = t.getAsAggregateType()) {
     for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
-      addUBForNoCaptureRet(s, agg->extract(svret, i), agg->getChild(i));
+      check_ret_attributes(s, agg->extract(sv, i), agg->getChild(i), attrs);
     }
   }
 }
@@ -2338,7 +2417,7 @@ StateValue Return::toSMT(State &s) const {
     retval = s[*val];
 
   s.addUB(s.getMemory().checkNocapture());
-  addUBForNoCaptureRet(s, retval, val->getType());
+  check_ret_attributes(s, retval, val->getType(), attrs);
 
   bool isDeref = attrs.has(FnAttrs::Dereferenceable);
   bool isNonNull = attrs.has(FnAttrs::NonNull);
@@ -2349,15 +2428,20 @@ StateValue Return::toSMT(State &s) const {
     Pointer p(s.getMemory(), retval.value);
 
     if (isDeref) {
-      s.addUB(p.isDereferenceable(attrs.derefBytes));
+      s.addUB(p.isDereferenceable(attrs.derefBytes, attrs.align));
       if (has_alloca)
         s.addUB(p.getAllocType() != Pointer::STACK);
-    }
-    if (isNonNull) {
-      s.addUB(p.isNonZero());
-    }
-    if (isAlign) {
-      s.addUB(p.isAligned(attrs.align));
+    } else if (isAlign)
+      retval.non_poison &= p.isAligned(attrs.align);
+
+    if (isNonNull)
+      retval.non_poison &= p.isNonZero();
+
+    if (attrs.poisonImpliesUB()) {
+      // Poison created from nonnull/align can raise UB if other attributes are
+      // involved
+      s.addUB(move(retval.non_poison));
+      retval.non_poison = true;
     }
   }
 
@@ -2423,6 +2507,8 @@ StateValue Assume::toSMT(State &s) const {
 }
 
 expr Assume::getTypeConstraints(const Function &f) const {
+  if (kind == WellDefined)
+    return true;
   return cond->getType().enforceIntType();
 }
 
@@ -2460,6 +2546,41 @@ MemInstr::ByteAccessInfo::get(const Type &t, bool store, unsigned align) {
 MemInstr::ByteAccessInfo
 MemInstr::ByteAccessInfo::full(unsigned byteSize) {
   return { true, true, true, byteSize };
+}
+
+static expr ptr_only_args(State &s, const FnAttrs &attrs, const expr &p) {
+  if (!attrs.has(FnAttrs::ArgMemOnly))
+    return true;
+
+  OrExpr e;
+  for (auto &in : s.getFn().getInputs()) {
+    auto &in_v = s[in];
+    e.add(in_v.non_poison && p == in_v.value);
+  }
+  return e();
+}
+
+static void check_can_load(State &s, const expr &p0) {
+  auto &attrs = s.getFn().getFnAttrs();
+  Pointer p(s.getMemory(), p0);
+
+  if (attrs.has(FnAttrs::NoRead))
+    s.addUB(p.isLocal());
+
+  s.addUB(p.isLocal() || ptr_only_args(s, attrs, p0));
+}
+
+static void check_can_store(State &s, const expr &p0) {
+  if (s.isInitializationPhase())
+    return;
+
+  auto &attrs = s.getFn().getFnAttrs();
+  Pointer p(s.getMemory(), p0);
+
+  if (attrs.has(FnAttrs::NoWrite))
+    s.addUB(p.isLocal());
+
+  s.addUB(p.isLocal() || ptr_only_args(s, attrs, p0));
 }
 
 
@@ -2563,6 +2684,9 @@ void Malloc::print(std::ostream &os) const {
 }
 
 StateValue Malloc::toSMT(State &s) const {
+  if (ptr && s.getFn().getFnAttrs().has(FnAttrs::NoFree))
+    s.addUB(expr(false));
+
   auto &m = s.getMemory();
   auto &[sz, np_size] = s.getAndAddUndefs(*size);
   s.addUB(np_size);
@@ -2581,6 +2705,7 @@ StateValue Malloc::toSMT(State &s) const {
   } else {
     auto &[p, np_ptr] = s.getAndAddUndefs(*ptr);
     s.addUB(np_ptr);
+    check_can_store(s, p);
 
     m.copy(Pointer(m, p), Pointer(m, p_new.subst(allocated, true).simplify()));
 
@@ -2903,6 +3028,7 @@ void Load::print(std::ostream &os) const {
 
 StateValue Load::toSMT(State &s) const {
   auto &p = s.getAndAddPoisonUB(*ptr).value;
+  check_can_load(s, p);
   auto [sv, ub] = s.getMemory().load(p, getType(), align);
   s.addUB(move(ub));
   return sv;
@@ -2944,7 +3070,16 @@ void Store::print(std::ostream &os) const {
 }
 
 StateValue Store::toSMT(State &s) const {
+  // skip large initializers. FIXME: this should be moved to memory so it can
+  // fold subsequent trivial loads
+  if (s.isInitializationPhase() &&
+      Memory::getStoreByteSize(val->getType()) / (bits_byte / 8) > 128) {
+    s.doesApproximation("Large constant initializer removed");
+    return {};
+  }
+
   auto &p = s.getAndAddPoisonUB(*ptr).value;
+  check_can_store(s, p);
   auto &v = s[*val];
   s.getMemory().store(p, v, val->getType(), align, s.getUndefVars());
   return {};
@@ -3001,6 +3136,7 @@ StateValue Memset::toSMT(State &s) const {
     s.addUB((vbytes != 0).implies(sv_ptr.non_poison));
     vptr = sv_ptr.value;
   }
+  check_can_store(s, vptr);
   s.getMemory().memset(vptr, s[*val].zextOrTrunc(8), vbytes, align,
                        s.getUndefVars());
   return {};
@@ -3072,6 +3208,8 @@ StateValue Memcpy::toSMT(State &s) const {
     s.addUB(
       vbytes.ule(expr::IntUMax(bits_size_t).zext(vbytes.bits() - bits_size_t)));
 
+  check_can_load(s, vsrc);
+  check_can_store(s, vdst);
   s.getMemory().memcpy(vdst, vsrc, vbytes, align_dst, align_src, move);
   return {};
 }
@@ -3120,6 +3258,9 @@ StateValue Memcmp::toSMT(State &s) const {
   auto &[vptr2, np2] = s[*ptr2];
   auto &vnum = s.getAndAddPoisonUB(*num).value;
   s.addUB((vnum != 0).implies(np1 && np2));
+
+  check_can_load(s, vptr1);
+  check_can_load(s, vptr2);
 
   Pointer p1(s.getMemory(), vptr1), p2(s.getMemory(), vptr2);
   // memcmp can be optimized to load & icmps, and it requires this
@@ -3214,6 +3355,7 @@ void Strlen::print(ostream &os) const {
 
 StateValue Strlen::toSMT(State &s) const {
   auto &eptr = s.getAndAddPoisonUB(*ptr).value;
+  check_can_load(s, eptr);
 
   Pointer p(s.getMemory(), eptr);
   Type &ty = getType();
@@ -3240,6 +3382,235 @@ expr Strlen::getTypeConstraints(const Function &f) const {
 
 unique_ptr<Instr> Strlen::dup(const string &suffix) const {
   return make_unique<Strlen>(getType(), getName() + suffix, *ptr);
+}
+
+
+vector<Value*> VaStart::operands() const {
+  return { ptr };
+}
+
+void VaStart::rauw(const Value &what, Value &with) {
+  RAUW(ptr);
+}
+
+void VaStart::print(ostream &os) const {
+  os << "call void @llvm.va_start(" << *ptr << ')';
+}
+
+StateValue VaStart::toSMT(State &s) const {
+  s.addUB(expr(s.getFn().isVarArgs()));
+
+  auto &data  = s.getVarArgsData();
+  auto &raw_p = s.getAndAddPoisonUB(*ptr, true).value;
+
+  expr zero     = expr::mkUInt(0, VARARG_BITS);
+  expr num_args = expr::mkVar("num_va_args", VARARG_BITS);
+
+  // just in case there's already a pointer there
+  OrExpr matched_one;
+  for (auto &[ptr, entry] : data) {
+    // FIXME. if entry.alive => memory leak (though not UB). detect this
+    expr eq = ptr == raw_p;
+    entry.alive      |= eq;
+    entry.next_arg    = expr::mkIf(eq, zero, entry.next_arg);
+    entry.num_args    = expr::mkIf(eq, num_args, entry.num_args);
+    entry.is_va_start = expr::mkIf(eq, true, entry.is_va_start);
+    matched_one.add(move(eq));
+  }
+
+  Pointer ptr(s.getMemory(), raw_p);
+  s.addUB(ptr.isBlockAlive());
+  s.addUB(ptr.blockSize().uge(4)); // FIXME: this is target dependent
+
+  // alive, next_arg, num_args, is_va_start, active
+  data.try_emplace(raw_p, expr(true), move(zero), move(num_args), expr(true),
+                   !matched_one());
+
+  return {};
+}
+
+expr VaStart::getTypeConstraints(const Function &f) const {
+  return ptr->getType().enforcePtrType();
+}
+
+unique_ptr<Instr> VaStart::dup(const string &suffix) const {
+  return make_unique<VaStart>(*ptr);
+}
+
+
+vector<Value*> VaEnd::operands() const {
+  return { ptr };
+}
+
+void VaEnd::rauw(const Value &what, Value &with) {
+  RAUW(ptr);
+}
+
+void VaEnd::print(ostream &os) const {
+  os << "call void @llvm.va_end(" << *ptr << ')';
+}
+
+template <typename D>
+static void ensure_varargs_ptr(D &data, State &s, const expr &arg_ptr) {
+  OrExpr matched_one;
+  for (auto &[ptr, entry] : data) {
+    matched_one.add(ptr == arg_ptr);
+  }
+
+  expr matched = matched_one();
+  if (matched.isTrue())
+    return;
+
+  // Insert a new entry in case there was none before.
+  // This might be a ptr passed as argument (va_start in the callee).
+  s.addUB(matched || !Pointer(s.getMemory(), arg_ptr).isLocal());
+
+  expr zero = expr::mkUInt(0, VARARG_BITS);
+  ENSURE(data.try_emplace(arg_ptr,
+                          expr::mkUF("vararg_alive", { arg_ptr }, false),
+                          expr(zero), // = next_arg
+                          expr::mkUF("vararg_num_args", { arg_ptr }, zero),
+                          expr(false), // = is_va_start
+                          !matched).second);
+}
+
+StateValue VaEnd::toSMT(State &s) const {
+  auto &data  = s.getVarArgsData();
+  auto &raw_p = s.getAndAddPoisonUB(*ptr, true).value;
+
+  s.addUB(Pointer(s.getMemory(), raw_p).isBlockAlive());
+
+  ensure_varargs_ptr(data, s, raw_p);
+
+  for (auto &[ptr, entry] : data) {
+    expr eq = ptr == raw_p;
+    s.addUB((eq && entry.active).implies(entry.alive));
+    entry.alive &= !eq;
+  }
+  return {};
+}
+
+expr VaEnd::getTypeConstraints(const Function &f) const {
+  return ptr->getType().enforcePtrType();
+}
+
+unique_ptr<Instr> VaEnd::dup(const string &suffix) const {
+  return make_unique<VaEnd>(*ptr);
+}
+
+
+vector<Value*> VaCopy::operands() const {
+  return { dst, src };
+}
+
+void VaCopy::rauw(const Value &what, Value &with) {
+  RAUW(dst);
+  RAUW(src);
+}
+
+void VaCopy::print(ostream &os) const {
+  os << "call void @llvm.va_copy(" << *dst << ", " << *src << ')';
+}
+
+StateValue VaCopy::toSMT(State &s) const {
+  auto &data = s.getVarArgsData();
+  auto &dst_raw = s.getAndAddPoisonUB(*dst, true).value;
+  auto &src_raw = s.getAndAddPoisonUB(*src, true).value;
+  Pointer dst(s.getMemory(), dst_raw);
+  Pointer src(s.getMemory(), src_raw);
+
+  s.addUB(dst.isBlockAlive());
+  s.addUB(src.isBlockAlive());
+  s.addUB(dst.blockSize() == src.blockSize());
+
+  ensure_varargs_ptr(data, s, src_raw);
+
+  DisjointExpr<expr> next_arg, num_args, is_va_start;
+  for (auto &[ptr, entry] : data) {
+    expr select = entry.active && ptr == src_raw;
+    s.addUB(select.implies(entry.alive));
+
+    next_arg.add(entry.next_arg, select);
+    num_args.add(entry.num_args, select);
+    is_va_start.add(entry.is_va_start, move(select));
+
+    // kill aliases
+    entry.active &= ptr != dst_raw;
+  }
+
+  // FIXME: dst should be empty or we have a mem leak
+  // alive, next_arg, num_args, is_va_start, active
+  data[dst_raw] = { true, *next_arg(), *num_args(), *is_va_start(), true };
+
+  return {};
+}
+
+expr VaCopy::getTypeConstraints(const Function &f) const {
+  return dst->getType().enforcePtrType() &&
+         src->getType().enforcePtrType();
+}
+
+unique_ptr<Instr> VaCopy::dup(const string &suffix) const {
+  return make_unique<VaCopy>(*dst, *src);
+}
+
+
+vector<Value*> VaArg::operands() const {
+  return { ptr };
+}
+
+void VaArg::rauw(const Value &what, Value &with) {
+  RAUW(ptr);
+}
+
+void VaArg::print(ostream &os) const {
+  os << getName() << " = va_arg " << *ptr << ", " << getType();
+}
+
+StateValue VaArg::toSMT(State &s) const {
+  auto &data  = s.getVarArgsData();
+  auto &raw_p = s.getAndAddPoisonUB(*ptr, true).value;
+
+  s.addUB(Pointer(s.getMemory(), raw_p).isBlockAlive());
+
+  ensure_varargs_ptr(data, s, raw_p);
+
+  DisjointExpr<StateValue> ret(StateValue{});
+  expr value_kind = getType().getDummyValue(false).value;
+  expr one = expr::mkUInt(1, VARARG_BITS);
+
+  for (auto &[ptr, entry] : data) {
+    string type = getType().toString();
+    string arg_name = "va_arg_" + type;
+    string arg_in_name = "va_arg_in_" + type;
+    StateValue val = {
+      expr::mkIf(entry.is_va_start,
+                 expr::mkUF(arg_name.c_str(), { entry.next_arg }, value_kind),
+                 expr::mkUF(arg_in_name.c_str(), { ptr, entry.next_arg },
+                            value_kind)),
+      expr::mkIf(entry.is_va_start,
+                 expr::mkUF("va_arg_np", { entry.next_arg }, true),
+                 expr::mkUF("va_arg_np_in", { ptr, entry.next_arg }, true))
+    };
+    expr eq = ptr == raw_p;
+    expr select = entry.active && eq;
+    ret.add(move(val), select);
+
+    expr next_arg = entry.next_arg + one;
+    s.addUB(select.implies(entry.alive && entry.num_args.uge(next_arg)));
+    entry.next_arg = expr::mkIf(eq, next_arg, entry.next_arg);
+  }
+
+  return *ret();
+}
+
+expr VaArg::getTypeConstraints(const Function &f) const {
+  return getType().enforceScalarType() &&
+         ptr->getType().enforcePtrType();
+}
+
+unique_ptr<Instr> VaArg::dup(const string &suffix) const {
+  return make_unique<VaArg>(getType(), getName() + suffix, *ptr);
 }
 
 
@@ -3333,16 +3704,11 @@ StateValue ShuffleVector::toSMT(State &s) const {
   auto sz = vty->numElementsConst();
   vector<StateValue> vals;
 
-  const StateValue *vect1 = nullptr;
-  const StateValue *vect2 = nullptr;
-
   for (auto m : mask) {
     if (m >= 2 * sz) {
       vals.emplace_back(UndefValue(vty->getChild(0)).toSMT(s).value, true);
     } else {
-      auto &vect = m < sz ? vect1 : vect2;
-      if (!vect)
-        vect = &s[m < sz ? *v1 : *v2];
+      auto *vect = &s[m < sz ? *v1 : *v2];
       vals.emplace_back(vty->extract(*vect, m % sz));
     }
   }
