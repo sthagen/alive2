@@ -320,20 +320,20 @@ static StateValue fm_poison(State &s, expr a, const expr &ap, expr b,
       non_poison &= !val.isInf();
   }
   if (fmath.flags & FastMathFlags::ARCP) {
-    s.useUnsupported("arcp");
-    non_poison &= expr(); // TODO
+    val = expr::mkUF("arcp", { val }, val);
+    s.doesApproximation("arcp", val);
   }
   if (fmath.flags & FastMathFlags::Contract) {
-    s.useUnsupported("contract");
-    non_poison &= expr(); // TODO
+    val = expr::mkUF("contract", { val }, val);
+    s.doesApproximation("contract", val);
   }
   if (fmath.flags & FastMathFlags::Reassoc) {
-    s.useUnsupported("reassoc");
-    non_poison &= expr(); // TODO
+    val = expr::mkUF("reassoc", { val }, val);
+    s.doesApproximation("reassoc", val);
   }
   if (fmath.flags & FastMathFlags::AFN) {
-    s.useUnsupported("afn");
-    non_poison &= expr(); // TODO
+    val = expr::mkUF("afn", { val }, val);
+    s.doesApproximation("afn", val);
   }
   if (fmath.flags & FastMathFlags::NSZ && !only_input)
     val = any_fp_zero(s, move(val));
@@ -606,8 +606,12 @@ StateValue BinOp::toSMT(State &s) const {
   case FRem:
     fn = [&](auto a, auto ap, auto b, auto bp) -> StateValue {
       // TODO; Z3 has no support for LLVM's frem which is actually an fmod
-      s.useUnsupported("frem");
-      return fm_poison(s, a, ap, b, bp, [](expr &a, expr &b) { return expr(); },
+      return fm_poison(s, a, ap, b, bp,
+                       [&](expr &a, expr &b) {
+                         auto val = expr::mkUF("fmod", {a, b}, a);
+                         s.doesApproximation("frem", val);
+                         return val;
+                       },
                        fmath, false);
     };
     break;
@@ -1285,7 +1289,6 @@ StateValue ConversionOp::toSMT(State &s) const {
     break;
   case Int2Ptr:
     fn = [&](auto &&val, auto &to_type) -> StateValue {
-      s.useUnsupported("inttoptr");
       return { s.getMemory().int2ptr(val), true };
     };
     break;
@@ -1689,7 +1692,6 @@ static void unpack_inputs(State &s, Value &argv, Type &ty,
     if (ty.isPtrType()) {
       expr np(true);
       Pointer p(s.getMemory(), move(value.value));
-      p.stripAttrs();
       if (argflag.has(ParamAttrs::Dereferenceable) ||
           argflag.has(ParamAttrs::ByVal))
         s.addUB(
@@ -2612,7 +2614,7 @@ void Alloc::rauw(const Value &what, Value &with) {
   RAUW(mul);
 }
 
-void Alloc::print(std::ostream &os) const {
+void Alloc::print(ostream &os) const {
   os << getName() << " = alloca " << *size;
   if (mul)
     os << " x " << *mul;
@@ -2674,7 +2676,7 @@ void Malloc::rauw(const Value &what, Value &with) {
   RAUW(ptr);
 }
 
-void Malloc::print(std::ostream &os) const {
+void Malloc::print(ostream &os) const {
   os << getName();
   if (!ptr)
     os << " = malloc ";
@@ -2761,7 +2763,7 @@ void Calloc::rauw(const Value &what, Value &with) {
   RAUW(size);
 }
 
-void Calloc::print(std::ostream &os) const {
+void Calloc::print(ostream &os) const {
   os << getName() << " = calloc " << *num << ", " << *size;
 }
 
@@ -2812,7 +2814,7 @@ void StartLifetime::rauw(const Value &what, Value &with) {
   RAUW(ptr);
 }
 
-void StartLifetime::print(std::ostream &os) const {
+void StartLifetime::print(ostream &os) const {
   os << "start_lifetime " << *ptr;
 }
 
@@ -2848,7 +2850,7 @@ void Free::rauw(const Value &what, Value &with) {
   RAUW(ptr);
 }
 
-void Free::print(std::ostream &os) const {
+void Free::print(ostream &os) const {
   os << "free " << *ptr << (heaponly ? "" : " unconstrained");
 }
 
@@ -2872,7 +2874,7 @@ unique_ptr<Instr> Free::dup(const string &suffix) const {
 }
 
 
-void GEP::addIdx(unsigned obj_size, Value &idx) {
+void GEP::addIdx(uint64_t obj_size, Value &idx) {
   idxs.emplace_back(obj_size, &idx);
 }
 
@@ -2881,16 +2883,34 @@ DEFINE_AS_RETZERO(GEP, getMaxAccessSize);
 DEFINE_AS_EMPTYACCESS(GEP);
 DEFINE_AS_RETFALSE(GEP, canFree);
 
+static unsigned off_used_bits(const Value &v) {
+  if (auto c = isCast(ConversionOp::SExt, v))
+    return off_used_bits(c->getValue());
+
+  if (auto ty = dynamic_cast<IntType*>(&v.getType()))
+    return min(ty->bits(), 64u);
+
+  return 64;
+}
+
 uint64_t GEP::getMaxGEPOffset() const {
-  int64_t off = 0;
+  uint64_t off = 0;
   for (auto &[mul, v] : getIdxs()) {
+    if (mul == 0)
+      continue;
+    if (mul >= INT64_MAX)
+      return UINT64_MAX;
+
     if (auto n = getInt(*v)) {
-      off += mul * *n;
+      off = add_saturate(off, abs((int64_t)mul * *n));
       continue;
     }
-    return UINT64_MAX;
+
+    off = add_saturate(off,
+                       mul_saturate(mul,
+                                    UINT64_MAX >> (64 - off_used_bits(*v))));
   }
-  return abs(off);
+  return off;
 }
 
 vector<Value*> GEP::operands() const {
@@ -2908,7 +2928,7 @@ void GEP::rauw(const Value &what, Value &with) {
   }
 }
 
-void GEP::print(std::ostream &os) const {
+void GEP::print(ostream &os) const {
   os << getName() << " = gep ";
   if (inbounds)
     os << "inbounds ";
@@ -3021,7 +3041,7 @@ void Load::rauw(const Value &what, Value &with) {
   RAUW(ptr);
 }
 
-void Load::print(std::ostream &os) const {
+void Load::print(ostream &os) const {
   os << getName() << " = load " << getType() << ", " << *ptr
      << ", align " << align;
 }
@@ -3065,7 +3085,7 @@ void Store::rauw(const Value &what, Value &with) {
   RAUW(ptr);
 }
 
-void Store::print(std::ostream &os) const {
+void Store::print(ostream &os) const {
   os << "store " << *val << ", " << *ptr << ", align " << align;
 }
 
@@ -3742,8 +3762,8 @@ bool hasNoSideEffects(const Instr &i) {
 }
 
 Value* isNoOp(const Value &v) {
-  if (isCast(ConversionOp::BitCast, v))
-    return &static_cast<const ConversionOp*>(&v)->getValue();
+  if (auto *c = isCast(ConversionOp::BitCast, v))
+    return &c->getValue();
 
   if (auto gep = dynamic_cast<const GEP*>(&v))
     return gep->getMaxGEPOffset() == 0 ? &gep->getPtr() : nullptr;

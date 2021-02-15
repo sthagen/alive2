@@ -33,7 +33,7 @@ static bool is_arbitrary(const expr &e) {
            isUnsat();
 }
 
-static void print_single_varval(ostream &os, State &st, const Model &m,
+static void print_single_varval(ostream &os, const State &st, const Model &m,
                                 const Value *var, const Type &type,
                                 const StateValue &val, unsigned child) {
   if (!val.isValid()) {
@@ -82,7 +82,7 @@ static void print_single_varval(ostream &os, State &st, const Model &m,
   }
 }
 
-static void print_varval(ostream &os, State &st, const Model &m,
+static void print_varval(ostream &os, const State &st, const Model &m,
                          const Value *var, const Type &type,
                          const StateValue &val, unsigned child = 0) {
   if (!type.isAggregateType()) {
@@ -104,27 +104,13 @@ static void print_varval(ostream &os, State &st, const Model &m,
 
 using print_var_val_ty = function<void(ostream&, const Model&)>;
 
-static void error(Errors &errs, State &src_state, State &tgt_state,
+static void error(Errors &errs, const State &src_state, const State &tgt_state,
                   const Result &r, const Value *var,
                   const char *msg, bool check_each_var,
                   print_var_val_ty print_var_val) {
 
   if (r.isInvalid()) {
     errs.add("Invalid expr", false);
-    auto unsupported = src_state.getUnsupported();
-    auto &u_tgt = tgt_state.getUnsupported();
-    unsupported.insert(u_tgt.begin(), u_tgt.end());
-    if (!unsupported.empty()) {
-      string str = "The program uses the following unsupported features: ";
-      bool first = true;
-      for (auto name : unsupported) {
-        if (!first)
-          str += ", ";
-        str += name;
-        first = false;
-      }
-      errs.add(move(str), false);
-    }
     return;
   }
 
@@ -148,20 +134,29 @@ static void error(Errors &errs, State &src_state, State &tgt_state,
   auto &var_name = var ? var->getName() : empty;
   auto &m = r.getModel();
 
-  auto &src_approx = src_state.getApproximations();
-  auto &tgt_approx = tgt_state.getApproximations();
-  if (!src_approx.empty() || !tgt_approx.empty()) {
-    s << "Couldn't prove the correctness of the transformation\n"
-         "Alive2 approximated the semantics of the programs and therefore we\n"
-         "cannot conclude whether the bug found is valid or not.\n\n"
-         "Approximations done:\n";
-    auto approx = src_approx;
-    approx.insert(tgt_approx.begin(), tgt_approx.end());
-    for (auto &a : approx) {
-      s << " - " << a << '\n';
+  {
+    // filter out approximations that don't contribute to the bug
+    // i.e., they don't show up in the SMT model
+    set<string> approx;
+    for (auto *v : { &src_state.getApproximations(),
+                     &tgt_state.getApproximations() }) {
+      for (auto &[msg, var] : *v) {
+        if (!var || m.hasFnModel(*var))
+          approx.emplace(msg);
+      }
     }
-    errs.add(s.str(), false);
-    return;
+
+    if (!approx.empty()) {
+      s << "Couldn't prove the correctness of the transformation\n"
+          "Alive2 approximated the semantics of the programs and therefore we\n"
+          "cannot conclude whether the bug found is valid or not.\n\n"
+          "Approximations done:\n";
+      for (auto &msg : approx) {
+        s << " - " << msg << '\n';
+      }
+      errs.add(s.str(), false);
+      return;
+    }
   }
 
   s << msg;
@@ -239,6 +234,12 @@ static void instantiate_undef(const Input *in, map<expr, expr> &instances,
 
   for (auto I = instances.begin(); I != instances.end();
        I = instances.erase(I)) {
+
+    if (hit_half_memory_limit()) {
+      instances2.insert(instances.begin(), instances.end());
+      break;
+    }
+
     auto &[e, v] = *I;
     for (unsigned i = 0; i < 2; ++i) {
       expr newexpr = e.subst(var, nums[i]);
@@ -258,13 +259,14 @@ static void instantiate_undef(const Input *in, map<expr, expr> &instances,
   instances = move(instances2);
 }
 
-static expr preprocess(Transform &t, const set<expr> &qvars0,
+static expr preprocess(const Transform &t, const set<expr> &qvars0,
                        const set<expr> &undef_qvars, expr &&e) {
   if (hit_half_memory_limit())
     return expr::mkForAll(qvars0, move(e));
 
   // eliminate all quantified boolean vars; Z3 gets too slow with those
   auto qvars = qvars0;
+  unsigned num_qvars_subst = 0;
   for (auto I = qvars.begin(); I != qvars.end(); ) {
     auto &var = *I;
     if (!var.isBool()) {
@@ -276,6 +278,10 @@ static expr preprocess(Transform &t, const set<expr> &qvars0,
 
     e = (e.subst(var, true) && e.subst(var, false)).simplify();
     I = qvars.erase(I);
+
+    // Z3's subst is *super* slow; avoid exponential run-time
+    if (++num_qvars_subst == 5)
+      break;
   }
 
   if (config::disable_undef_input || undef_qvars.empty() ||
@@ -348,11 +354,24 @@ static expr encode_undef_refinement(const Type &type, const State::ValTy &a,
 }
 
 static void
-check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
-                 const Value *var, const Type &type,
+check_refinement(Errors &errs, const Transform &t, const State &src_state,
+                 const State &tgt_state, const Value *var, const Type &type,
                  const expr &dom_a, const expr &fndom_a, const State::ValTy &ap,
                  const expr &dom_b, const expr &fndom_b, const State::ValTy &bp,
                  bool check_each_var) {
+  if (src_state.sinkDomain().isTrue()) {
+    errs.add("The source program doesn't reach a return instruction.\n"
+             "Consider increasing the unroll factor if it has loops", false);
+    return;
+  }
+
+  auto sink_tgt = tgt_state.sinkDomain();
+  if (sink_tgt.isTrue()) {
+    errs.add("The target program doesn't reach a return instruction.\n"
+             "Consider increasing the unroll factor if it has loops", false);
+    return;
+  }
+
   auto &a = ap.first;
   auto &b = bp.first;
 
@@ -361,17 +380,6 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   qvars.insert(ap.second.begin(), ap.second.end());
   auto &fn_qvars = tgt_state.getFnQuantVars();
   qvars.insert(fn_qvars.begin(), fn_qvars.end());
-
-  auto err = [&](const Result &r, print_var_val_ty print, const char *msg) {
-    error(errs, src_state, tgt_state, r, var, msg, check_each_var, print);
-  };
-
-  auto print_value = [&](ostream &s, const Model &m) {
-    s << "Source value: ";
-    print_varval(s, src_state, m, var, type, a);
-    s << "\nTarget value: ";
-    print_varval(s, tgt_state, m, var, type, b);
-  };
 
   AndExpr axioms = src_state.getAxioms();
   axioms.add(tgt_state.getAxioms());
@@ -390,10 +398,12 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   expr pre_tgt = pre_tgt_and();
 
   expr axioms_expr = axioms();
-  expr dom = dom_a && dom_b;
-
-  auto sink_tgt = tgt_state.sinkDomain();
   pre_tgt &= !sink_tgt;
+
+  if (check_expr(axioms_expr && (pre_src && pre_tgt)).isUnsat()) {
+    errs.add("Precondition is always false", false);
+    return;
+  }
 
   expr pre_src_exists, pre_src_forall;
   {
@@ -409,35 +419,6 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
   expr pre = pre_src_exists && pre_tgt && src_state.getFnPre();
   pre_src_forall &= tgt_state.getFnPre();
 
-  auto [poison_cnstr, value_cnstr] = type.refines(src_state, tgt_state, a, b);
-  expr undef_cnstr = encode_undef_refinement(type, ap, bp);
-
-  auto src_mem = src_state.returnMemory();
-  auto tgt_mem = tgt_state.returnMemory();
-  auto [memory_cnstr0, ptr_refinement0, mem_undef]
-    = src_mem.refined(tgt_mem, false);
-  auto &ptr_refinement = ptr_refinement0;
-  auto memory_cnstr = memory_cnstr0.isTrue() ? memory_cnstr0
-                                             : value_cnstr && memory_cnstr0;
-  qvars.insert(mem_undef.begin(), mem_undef.end());
-
-  if (src_state.sinkDomain().isTrue()) {
-    errs.add("The source program doesn't reach a return instruction.\n"
-             "Consider increasing the unroll factor if it has loops", false);
-    return;
-  }
-
-  if (sink_tgt.isTrue()) {
-    errs.add("The target program doesn't reach a return instruction.\n"
-             "Consider increasing the unroll factor if it has loops", false);
-    return;
-  }
-
-  if (check_expr(axioms_expr && (pre_src && pre_tgt)).isUnsat()) {
-    errs.add("Precondition is always false", false);
-    return;
-  }
-
   auto mk_fml = [&](expr &&refines) -> expr {
     // from the check above we already know that
     // \exists v,v' . pre_tgt(v') && pre_src(v) is SAT (or timeout)
@@ -452,6 +433,68 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
             preprocess(t, qvars, uvars, pre && pre_src_forall.implies(refines));
   };
 
+  auto check = [&](expr &&e, auto &&printer, const char *msg) -> bool{
+    e = mk_fml(move(e));
+    auto res = check_expr(e);
+    if (res.isUnsat()) {
+      return true;
+    } else {
+      error(errs, src_state, tgt_state, res, var, msg, check_each_var, printer);
+      return false;
+    }
+  };
+
+#define CHECK(fml, printer, msg) \
+  if (!check(fml, printer, msg)) \
+    return
+
+  // 1. Check UB
+  CHECK(fndom_a.notImplies(fndom_b),
+        [](ostream&, const Model&){}, "Source is more defined than target");
+
+  // 2. Check return domain (noreturn check)
+  {
+    expr dom_constr;
+    if (dom_a.eq(fndom_a) && dom_b.eq(fndom_b)) { // A /\ B /\ A != B
+      dom_constr = false;
+    } else {
+      dom_constr = (fndom_a && fndom_b) && dom_a != dom_b;
+    }
+
+    CHECK(move(dom_constr),
+          [](ostream&, const Model&){},
+          "Source and target don't have the same return domain");
+  }
+
+  // 3. Check poison
+  auto print_value = [&](ostream &s, const Model &m) {
+    s << "Source value: ";
+    print_varval(s, src_state, m, var, type, a);
+    s << "\nTarget value: ";
+    print_varval(s, tgt_state, m, var, type, b);
+  };
+
+  auto [poison_cnstr, value_cnstr] = type.refines(src_state, tgt_state, a, b);
+  expr dom = dom_a && dom_b;
+
+  CHECK(dom && !poison_cnstr,
+        print_value, "Target is more poisonous than source");
+
+  // 4. Check undef
+  CHECK(dom && encode_undef_refinement(type, ap, bp),
+        print_value, "Target's return value is more undefined");
+
+  // 5. Check value
+  CHECK(dom && !value_cnstr, print_value, "Value mismatch");
+
+  // 6. Check memory
+  auto src_mem = src_state.returnMemory();
+  auto tgt_mem = tgt_state.returnMemory();
+  auto [memory_cnstr0, ptr_refinement0, mem_undef]
+    = src_mem.refined(tgt_mem, false);
+  auto &ptr_refinement = ptr_refinement0;
+  qvars.insert(mem_undef.begin(), mem_undef.end());
+
   auto print_ptr_load = [&](ostream &s, const Model &m) {
     set<expr> undef;
     Pointer p(src_mem, m[ptr_refinement()]);
@@ -460,46 +503,11 @@ check_refinement(Errors &errs, Transform &t, State &src_state, State &tgt_state,
       << "\nTarget value: " << Byte(tgt_mem, m[tgt_mem.load(p, undef)()]);
   };
 
-  expr dom_constr;
-  if (dom_a.eq(fndom_a)) {
-    if (dom_b.eq(fndom_b)) // A /\ B /\ A != B
-       dom_constr = false;
-    else // A /\ B /\ A != C
-      dom_constr = fndom_a && fndom_b && !dom_b;
-  } else if (dom_b.eq(fndom_b)) { // A /\ B /\ C != B
-    dom_constr = fndom_a && fndom_b && !dom_a;
-  } else {
-    dom_constr = (fndom_a && fndom_b) && dom_a != dom_b;
-  }
+  CHECK(dom && !(memory_cnstr0.isTrue() ? memory_cnstr0
+                                        : value_cnstr && memory_cnstr0),
+        print_ptr_load, "Mismatch in memory");
 
-  Solver::check({
-    { mk_fml(fndom_a.notImplies(fndom_b)),
-      [&](const Result &r) {
-        err(r, [](ostream&, const Model&){},
-            "Source is more defined than target");
-      }},
-    { mk_fml(move(dom_constr)),
-      [&](const Result &r) {
-        err(r, [](ostream&, const Model&){},
-            "Source and target don't have the same return domain");
-      }},
-    { mk_fml(dom && !poison_cnstr),
-      [&](const Result &r) {
-        err(r, print_value, "Target is more poisonous than source");
-      }},
-    { mk_fml(dom && undef_cnstr),
-      [&](const Result &r) {
-        err(r, print_value, "Target's return value is more undefined");
-      }},
-    { mk_fml(dom && !value_cnstr),
-      [&](const Result &r) {
-        err(r, print_value, "Value mismatch");
-      }},
-    { mk_fml(dom && !memory_cnstr),
-      [&](const Result &r) {
-        err(r, print_ptr_load, "Mismatch in memory");
-      }}
-  });
+#undef CHECK
 }
 
 static bool has_nullptr(const Value *v) {
@@ -841,7 +849,7 @@ static void calculateAndInitConstants(Transform &t) {
   // check if null block is needed
   // Global variables cannot be null pointers
   has_null_block = num_ptrinputs > 0 || nullptr_is_used || has_malloc ||
-                  has_ptr_load || has_fncall;
+                  has_ptr_load || has_fncall || has_int2ptr;
 
   num_nonlocals_src = num_globals_src + num_ptrinputs + num_nonlocals_inst_src +
                       has_null_block;
@@ -882,6 +890,7 @@ static void calculateAndInitConstants(Transform &t) {
     = ilog2_ceil(add_saturate(max(max_gep_src, max_gep_tgt), max_access_size),
                  true) + 1;
   bits_for_offset = min(round_up(max_geps, 4), (uint64_t)t.src.bitsPtrOffset());
+  bits_for_offset = min(bits_for_offset, config::max_offset_bits);
 
   // we need an extra bit because 1st bit of size is always 0
   bits_size_t = ilog2_ceil(max_alloc_size, true);

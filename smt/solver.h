@@ -5,8 +5,6 @@
 
 #include "smt/expr.h"
 #include <cassert>
-#include <cstdint>
-#include <functional>
 #include <ostream>
 #include <string>
 #include <utility>
@@ -26,7 +24,7 @@ class Model {
   friend class Result;
 
 public:
-  Model(Model &&other) : m(0) {
+  Model(Model &&other) noexcept : m(0) {
     std::swap(other.m, m);
   }
 
@@ -36,6 +34,7 @@ public:
   expr eval(const expr &var, bool complete = false) const;
   uint64_t getUInt(const expr &var) const;
   int64_t getInt(const expr &var) const;
+  bool hasFnModel(const expr &fn) const;
 
   class iterator {
     Z3_model m;
@@ -89,20 +88,11 @@ private:
 };
 
 
-class Solver;
-
-class SolverPush {
-  Solver &s;
-public:
-  SolverPush(Solver &s);
-  ~SolverPush();
-};
-
-
 class Solver {
   Z3_solver s;
   bool valid = true;
-  using E = std::pair<expr, std::function<void(const Result &r)>>;
+  bool is_unsat = false;
+
 public:
   Solver(bool simple = false);
   ~Solver();
@@ -115,12 +105,19 @@ public:
   expr assertions() const;
 
   Result check() const;
-  static void check(std::initializer_list<E> queries);
 
   friend class SolverPush;
 };
 
 Result check_expr(const expr &e);
+
+
+class SolverPush {
+  Solver &s;
+public:
+  SolverPush(Solver &s);
+  ~SolverPush();
+};
 
 
 void solver_print_queries(bool yes);

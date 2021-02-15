@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <z3.h>
@@ -185,6 +186,11 @@ int64_t Model::getInt(const expr &var) const {
   return n;
 }
 
+bool Model::hasFnModel(const expr &fn) const {
+  auto fn_decl = fn.decl();
+  return fn_decl ? Z3_model_has_interp(ctx(), m, fn_decl) : false;
+}
+
 pair<expr, expr> Model::iterator::operator*(void) const {
   auto decl = Z3_model_get_const_decl(ctx(), m, idx);
   return { expr::mkConst(decl), Z3_model_get_const_interp(ctx(), m, decl) };
@@ -200,15 +206,6 @@ Model::iterator Model::end() const {
 
 ostream& operator<<(ostream &os, const Model &m) {
   return os << Z3_model_to_string(ctx(), m.m);
-}
-
-
-SolverPush::SolverPush(Solver &s) : s(s) {
-  Z3_solver_push(ctx(), s.s);
-}
-
-SolverPush::~SolverPush() {
-  Z3_solver_pop(ctx(), s.s, 1);
 }
 
 
@@ -233,7 +230,9 @@ Solver::~Solver() {
 }
 
 void Solver::add(const expr &e) {
-  if (e.isValid()) {
+  if (e.isFalse()) {
+    is_unsat = true;
+  } else if (e.isValid()) {
     auto ast = e();
     Z3_solver_assert(ctx(), s, ast);
     tactic->add(ast);
@@ -283,14 +282,19 @@ expr Solver::assertions() const {
 }
 
 Result Solver::check() const {
-  if (config::skip_smt) {
-    ++num_skips;
-    return Result::SKIP;
-  }
-
   if (!valid) {
     ++num_invalid;
     return Result::INVALID;
+  }
+
+  if (is_unsat) {
+    ++num_trivial;
+    return Result::UNSAT;
+  }
+
+  if (config::skip_smt) {
+    ++num_skips;
+    return Result::SKIP;
   }
 
   ++num_queries;
@@ -307,40 +311,16 @@ Result Solver::check() const {
     ++num_sats;
     return Z3_solver_get_model(ctx(), s);
   case Z3_L_UNDEF: {
-    string reason = Z3_solver_get_reason_unknown(ctx(), s);
+    string_view reason = Z3_solver_get_reason_unknown(ctx(), s);
     if (reason == "timeout") {
       ++num_timeout;
       return Result::TIMEOUT;
     }
     ++num_errors;
-    return { Result::ERROR, move(reason) };
+    return { Result::ERROR, string(reason) };
   }
   default:
     UNREACHABLE();
-  }
-}
-
-void Solver::check(initializer_list<E> queries) {
-  for (auto &[q, error] : queries) {
-    if (!q.isValid()) {
-      ++num_invalid;
-      error(Result::INVALID);
-      return;
-    }
-
-    if (q.isFalse()) {
-      ++num_trivial;
-      continue;
-    }
-
-    // TODO: benchmark: reset() or new solver every time?
-    Solver s;
-    s.add(q);
-    auto res = s.check();
-    if (!res.isUnsat()) {
-      error(res);
-      return;
-    }
   }
 }
 
@@ -349,6 +329,16 @@ Result check_expr(const expr &e) {
   s.add(e);
   return s.check();
 }
+
+
+SolverPush::SolverPush(Solver &s) : s(s) {
+  Z3_solver_push(ctx(), s.s);
+}
+
+SolverPush::~SolverPush() {
+  Z3_solver_pop(ctx(), s.s, 1);
+}
+
 
 void solver_print_stats(ostream &os) {
   float total = num_queries / 100.0;

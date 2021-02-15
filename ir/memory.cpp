@@ -1619,7 +1619,10 @@ expr Memory::ptr2int(const expr &ptr) const {
 expr Memory::int2ptr(const expr &val) const {
   assert(!memory_unused());
   // TODO
-  return {};
+  expr null = Pointer::mkNullPointer(*this).release();
+  expr fn = expr::mkUF("int2ptr", { val }, null);
+  state->doesApproximation("inttoptr", fn);
+  return expr::mkIf(val == 0, null, fn);
 }
 
 expr Memory::blockValRefined(const Memory &other, unsigned bid, bool local,

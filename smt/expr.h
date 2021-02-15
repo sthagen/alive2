@@ -17,7 +17,6 @@ typedef struct _Z3_func_decl* Z3_decl;
 typedef struct _Z3_app* Z3_app;
 typedef struct _Z3_ast* Z3_ast;
 typedef struct _Z3_sort* Z3_sort;
-typedef struct _Z3_func_decl* Z3_func_decl;
 
 namespace smt {
 
@@ -64,14 +63,14 @@ class expr {
   static Z3_ast mkFalse();
   static expr mkUInt(uint64_t n, Z3_sort sort);
   static expr mkInt(int64_t n, Z3_sort sort);
-  static expr mkConst(Z3_func_decl decl);
+  static expr mkConst(Z3_decl decl);
 
   bool isBinOp(expr &a, expr &b, int z3op) const;
 
 public:
   expr() : ptr(0) {}
 
-  expr(expr &&other) : ptr(0) {
+  expr(expr &&other) noexcept : ptr(0) {
     std::swap(ptr, other.ptr);
   }
 
@@ -358,7 +357,6 @@ public:
 
   friend class Solver;
   friend class Model;
-  friend class ExprLeafIterator;
 };
 
 
