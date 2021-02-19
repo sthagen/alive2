@@ -2550,14 +2550,28 @@ MemInstr::ByteAccessInfo::full(unsigned byteSize) {
   return { true, true, true, byteSize };
 }
 
-static expr ptr_only_args(State &s, const FnAttrs &attrs, const expr &p) {
-  if (!attrs.has(FnAttrs::ArgMemOnly))
-    return true;
+static void eq_bids(OrExpr &acc, Memory &m, const Type &t,
+                    const StateValue &val, const expr &bid) {
+  if (auto agg = t.getAsAggregateType()) {
+    for (unsigned i = 0, e = agg->numElementsConst(); i != e; ++i) {
+      eq_bids(acc, m, agg->getChild(i), agg->extract(val, i), bid);
+    }
+    return;
+  }
+
+  if (t.isPtrType()) {
+    acc.add(val.non_poison && Pointer(m, val.value).getBid() == bid);
+  }
+}
+
+static expr ptr_only_args(State &s, const Pointer &p) {
+  expr bid = p.getBid();
+  auto &m  = s.getMemory();
 
   OrExpr e;
   for (auto &in : s.getFn().getInputs()) {
-    auto &in_v = s[in];
-    e.add(in_v.non_poison && p == in_v.value);
+    if (hasPtr(in.getType()))
+      eq_bids(e, m, in.getType(), s[in], bid);
   }
   return e();
 }
@@ -2568,8 +2582,8 @@ static void check_can_load(State &s, const expr &p0) {
 
   if (attrs.has(FnAttrs::NoRead))
     s.addUB(p.isLocal());
-
-  s.addUB(p.isLocal() || ptr_only_args(s, attrs, p0));
+  else if (attrs.has(FnAttrs::ArgMemOnly))
+    s.addUB(p.isLocal() || ptr_only_args(s, p));
 }
 
 static void check_can_store(State &s, const expr &p0) {
@@ -2581,8 +2595,8 @@ static void check_can_store(State &s, const expr &p0) {
 
   if (attrs.has(FnAttrs::NoWrite))
     s.addUB(p.isLocal());
-
-  s.addUB(p.isLocal() || ptr_only_args(s, attrs, p0));
+  else if (attrs.has(FnAttrs::ArgMemOnly))
+    s.addUB(p.isLocal() || ptr_only_args(s, p));
 }
 
 
@@ -3047,7 +3061,7 @@ void Load::print(ostream &os) const {
 }
 
 StateValue Load::toSMT(State &s) const {
-  auto &p = s.getAndAddPoisonUB(*ptr).value;
+  auto &p = s.getAndAddPoisonUB(*ptr, true).value;
   check_can_load(s, p);
   auto [sv, ub] = s.getMemory().load(p, getType(), align);
   s.addUB(move(ub));
@@ -3098,7 +3112,7 @@ StateValue Store::toSMT(State &s) const {
     return {};
   }
 
-  auto &p = s.getAndAddPoisonUB(*ptr).value;
+  auto &p = s.getAndAddPoisonUB(*ptr, true).value;
   check_can_store(s, p);
   auto &v = s[*val];
   s.getMemory().store(p, v, val->getType(), align, s.getUndefVars());
@@ -3145,15 +3159,17 @@ void Memset::print(ostream &os) const {
 }
 
 StateValue Memset::toSMT(State &s) const {
-  auto &vbytes = s.getAndAddPoisonUB(*bytes).value;
+  auto &vbytes = s.getAndAddPoisonUB(*bytes, true).value;
 
   uint64_t n;
   expr vptr;
   if (vbytes.isUInt(n) && n > 0) {
-    vptr = s.getAndAddPoisonUB(*ptr).value;
+    vptr = s.getAndAddPoisonUB(*ptr, true).value;
   } else {
     auto &sv_ptr = s[*ptr];
-    s.addUB((vbytes != 0).implies(sv_ptr.non_poison));
+    auto &sv_ptr2 = s[*ptr];
+    s.addUB((vbytes != 0).implies(
+        sv_ptr.non_poison && (sv_ptr.value == sv_ptr2.value)));
     vptr = sv_ptr.value;
   }
   check_can_store(s, vptr);
@@ -3209,17 +3225,20 @@ void Memcpy::print(ostream &os) const {
 }
 
 StateValue Memcpy::toSMT(State &s) const {
-  auto &vbytes = s.getAndAddPoisonUB(*bytes).value;
+  auto &vbytes = s.getAndAddPoisonUB(*bytes, true).value;
 
   uint64_t n;
   expr vsrc, vdst;
   if (vbytes.isUInt(n) && n > 0) {
-    vdst = s.getAndAddPoisonUB(*dst).value;
-    vsrc = s.getAndAddPoisonUB(*src).value;
+    vdst = s.getAndAddPoisonUB(*dst, true).value;
+    vsrc = s.getAndAddPoisonUB(*src, true).value;
   } else {
     auto &sv_dst = s[*dst];
+    auto &sv_dst2 = s[*dst];
     auto &sv_src = s[*src];
-    s.addUB((vbytes != 0).implies(sv_dst.non_poison && sv_src.non_poison));
+    auto &sv_src2 = s[*src];
+    s.addUB((vbytes != 0).implies(sv_dst.non_poison && sv_src.non_poison &&
+        (sv_dst.value == sv_dst2.value && sv_src.value == sv_src2.value)));
     vdst = sv_dst.value;
     vsrc = sv_src.value;
   }
